@@ -1,0 +1,19 @@
+# Windows + Anaconda + RTX4060 摄像头实时 OCR + LM Studio 纠错
+# 建议：conda create -n ocr_llm python=3.10 && conda activate ocr_llm
+
+opencv-python>=4.5.0
+Pillow>=8.0.0
+numpy>=1.19.0
+
+# OCR（二选一或都装；当前默认 PaddleOCR）
+# easyocr>=1.7.0
+# PaddleOCR：先装 PaddlePaddle，再装 PaddleOCR。GPU：pip install paddlepaddle-gpu（按 CUDA 版本选）
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+
+# LLM 调用（LM Studio OpenAI 兼容）
+openai>=1.0.0
+
+# 语音朗读（朗读 Agent：自动英/法检测 + edge-tts）
+edge-tts>=6.1.0
+langdetect>=1.0.9

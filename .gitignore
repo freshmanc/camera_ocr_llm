@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 环境
+.venv/
+venv/
+env/
+
+# 日志与生成文件（保留目录结构可加 logs/ 等）
+logs/*.log
+logs/tts/*.mp3
+*.mp3
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地配置或密钥（若有）
+.env
+.env.local
+*.local

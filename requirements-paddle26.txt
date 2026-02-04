@@ -1,0 +1,28 @@
+# 推荐环境（Windows 最稳）：Python 3.10 + 下面两个包必须是指定版本，不能升级
+# 升级到 PaddleOCR 3.x 会走 paddlex/PDX，报「PDX has already been initialized」
+paddlepaddle==2.6.2
+paddleocr==2.7.0.3
+
+# 与 Paddle 2.6 兼容的 numpy（避免 ABI 报错）
+numpy>=1.23,<2
+
+# 本项目通用依赖
+opencv-python>=4.5.0
+Pillow>=8.0.0
+
+# LLM（LM Studio OpenAI 兼容）
+openai>=1.0.0
+
+# 语音朗读
+edge-tts>=6.1.0
+langdetect>=1.0.9
+
+# 对话框内「🔊 播放」应用内播放（不弹窗）。二选一或都装即可，优先用 pygame
+pygame>=2.1.0
+# playsound>=1.3.0
+
+# 语音助手 - 语音输入（可选，不装则只能用 I 键文字输入）
+# SpeechRecognition>=3.10.0
+# pyaudio>=0.2.14
+# 更准的识别（可选）：pip install openai-whisper，config 中 VOICE_RECOGNITION_ENGINE = "whisper"
+# 录音降噪（可选）：pip install noisereduce，config 中 VOICE_REDUCE_NOISE = True
