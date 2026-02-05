@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>OCR + LLM 识别</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>OCR + LLM 识别</h1>
+      <p class="subtitle">上传或拍摄图片，获取文字识别与纠错结果</p>
+    </header>
+
+    <section class="upload">
+      <label class="file-label">
+        <input type="file" id="file" accept="image/*" capture="environment">
+        <span class="file-btn">选择图片 / 拍照</span>
+      </label>
+      <div id="preview" class="preview" aria-hidden="true"></div>
+    </section>
+
+    <section class="actions">
+      <button type="button" id="recognize" class="btn btn-primary" disabled>识别</button>
+      <span id="status" class="status"></span>
+    </section>
+
+    <section class="result" id="result" aria-hidden="true">
+      <h2>识别结果</h2>
+      <div class="field">
+        <label>初始 OCR</label>
+        <pre id="raw-ocr"></pre>
+      </div>
+      <div class="field">
+        <label>校验后</label>
+        <pre id="corrected"></pre>
+      </div>
+      <div class="meta">
+        <span id="confidence"></span>
+        <span id="timing"></span>
+        <span id="error-msg" class="error"></span>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

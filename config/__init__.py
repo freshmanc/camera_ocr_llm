@@ -120,8 +120,8 @@ VOICE_ASSISTANT_SYSTEM_DIRECT = ""
 KEY_CHAT_INPUT = ord("i")      # I = 弹出文字输入框，与助手对话
 KEY_VOICE_INPUT = ord("v")     # V = 语音输入（需安装 SpeechRecognition + pyaudio）
 # 语音识别引擎：google=谷歌网页 API（需联网）；whisper=本地 Whisper（更准、可离线，需 pip install openai-whisper）
-# Windows 上 Whisper 可能报 WinError 127（DLL/依赖缺失），此时会自动回退到谷歌识别
-VOICE_RECOGNITION_ENGINE = "whisper"
+# Windows 上 Whisper 常因 torch/shm.dll 报 WinError 127，默认用 google 避免报错；若本机 Whisper 正常可改为 "whisper"
+VOICE_RECOGNITION_ENGINE = "google"
 # 录音后是否先降噪再识别（需 pip install noisereduce，可选）
 VOICE_REDUCE_NOISE = True
 # 「读一下」：只要有画面文字就优先直接朗读，不走 LLM，避免顺序错乱和延迟；仅当无文字时才走 LLM

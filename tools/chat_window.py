@@ -377,15 +377,14 @@ class ChatWindow:
                     except AttributeError:
                         text = r.recognize_google(audio, language="zh-CN")
                     except Exception as e_whisper:
-                        # Windows 上 Whisper 常因 WinError 127（DLL/依赖缺失或冲突）失败，回退到谷歌
+                        # Windows 上 Whisper 常因 WinError 127（DLL/依赖缺失）失败，静默回退到谷歌
                         try:
-                            import sys
-                            print(f"[语音] Whisper 失败，回退谷歌: {e_whisper}", file=sys.stderr)
+                            from tools.logger_util import log
+                            log("语音识别回退到谷歌（Whisper 不可用）", level="DEBUG")
                         except Exception:
                             pass
                         try:
                             text = r.recognize_google(audio, language="zh-CN")
-                            self.state.append_chat("assistant", "（Whisper 不可用，已用谷歌识别；需联网）")
                         except Exception:
                             raise
                 if text is None:
@@ -454,6 +453,11 @@ class ChatWindow:
         if not self._root or not self._chat_text:
             return
         try:
+            if not self._root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
             # 更新「打开/关闭摄像头」按钮文案（与主循环的启停一致）
             if self._camera_btn:
                 try:
@@ -473,9 +477,16 @@ class ChatWindow:
             import time as time_mod
             history = self.state.get_chat_history()
             streaming = self.state.get_streaming_content()
-            sig = str(len(history)) + (str(history[-1]) if history else "")
+            # 用长度 + 最后一条的角色与内容长度做签名，避免 str(history[-1]) 编码或过长导致漏刷
+            if history:
+                last = history[-1]
+                role = last[0] if len(last) > 0 else ""
+                text_len = len((last[1] or "") if len(last) > 1 else "")
+                sig = "%d_%s_%d" % (len(history), role, text_len)
+            else:
+                sig = "0"
             if streaming is not None:
-                sig += "_stream_%d" % len(streaming)  # 流式时随内容增长触发重绘，及时显示 LLM 输出
+                sig += "_stream_%d" % len(streaming)
             if sig == self._last_history_sig:
                 return
             self._last_history_sig = sig
@@ -499,43 +510,75 @@ class ChatWindow:
                 self._chat_text.insert(tk.END, "────────── 对话 ──────────\n\n")
             play_idx = 0
             for item in history:
-                role = item[0]
-                text = item[1] if len(item) > 1 else ""
-                ts = item[2] if len(item) > 2 else None
-                audio_path = (item[3] if len(item) > 3 else "") or ""
-                tstr = time_mod.strftime("%H:%M:%S", time_mod.localtime(ts)) if ts else ""
-                prefix = ("我 " + tstr + "  ") if role == "user" else ("助手 " + tstr + "  ")
-                content = (text or "").strip()
-                if role == "assistant":
-                    content = _ensure_paragraph_breaks(content)
-                lines = _wrap_text(content)
-                for i, line in enumerate(lines):
-                    if line == "":
+                try:
+                    role = str(item[0]) if item else "user"
+                    text = item[1] if len(item) > 1 else ""
+                    try:
+                        text = str(text).strip() if text is not None else ""
+                    except Exception:
+                        text = ""
+                    ts = item[2] if len(item) > 2 else None
+                    try:
+                        tstr = time_mod.strftime("%H:%M:%S", time_mod.localtime(ts)) if ts is not None else ""
+                    except Exception:
+                        tstr = ""
+                    audio_path = (item[3] if len(item) > 3 else "") or ""
+                    audio_path = str(audio_path) if audio_path else ""
+                    prefix = ("我 " + tstr + "  ") if role == "user" else ("助手 " + tstr + "  ")
+                    content = text
+                    if role == "assistant":
+                        try:
+                            content = _ensure_paragraph_breaks(content)
+                        except Exception:
+                            pass
+                    try:
+                        lines = _wrap_text(content)
+                    except Exception:
+                        lines = [content[:500]] if content else [""]
+                    for i, line in enumerate(lines):
+                        try:
+                            line_str = str(line) if line is not None else ""
+                            if line_str == "":
+                                self._chat_text.insert(tk.END, "\n")
+                            else:
+                                self._chat_text.insert(tk.END, (prefix if i == 0 else "    ") + line_str + "\n")
+                        except tk.TclError:
+                            try:
+                                raw = str(line) if line is not None else ""
+                                safe = (prefix if i == 0 else "    ") + raw.encode("ascii", errors="replace").decode("ascii")
+                                self._chat_text.insert(tk.END, safe + "\n")
+                            except Exception:
+                                self._chat_text.insert(tk.END, (prefix if i == 0 else "    ") + "(内容略)\n")
+                        except Exception:
+                            self._chat_text.insert(tk.END, (prefix if i == 0 else "    ") + "(内容略)\n")
+                    if audio_path and role == "assistant" and os.path.isfile(audio_path):
+                        play_idx += 1
+                        path_for_btn = audio_path
+                        btn = tk.Button(
+                            self._chat_text,
+                            text=" 🔊 播放 ",
+                            font=("Microsoft YaHei UI", 10, "bold"),
+                            fg="#fff",
+                            bg="#0066cc",
+                            activeforeground="#fff",
+                            activebackground="#0052a3",
+                            relief=tk.FLAT,
+                            padx=8,
+                            pady=2,
+                            cursor="hand2",
+                            command=(lambda p=path_for_btn: self._play_audio_in_app(p)),
+                        )
+                        self._chat_text.insert(tk.END, " ")
+                        self._chat_text.window_create(tk.END, window=btn)
                         self._chat_text.insert(tk.END, "\n")
                     else:
-                        self._chat_text.insert(tk.END, (prefix if i == 0 else "    ") + line + "\n")
-                if audio_path and role == "assistant" and os.path.isfile(audio_path):
-                    play_idx += 1
-                    path_for_btn = audio_path
-                    btn = tk.Button(
-                        self._chat_text,
-                        text=" 🔊 播放 ",
-                        font=("Microsoft YaHei UI", 10, "bold"),
-                        fg="#fff",
-                        bg="#0066cc",
-                        activeforeground="#fff",
-                        activebackground="#0052a3",
-                        relief=tk.FLAT,
-                        padx=8,
-                        pady=2,
-                        cursor="hand2",
-                        command=(lambda p=path_for_btn: self._play_audio_in_app(p)),
-                    )
-                    self._chat_text.insert(tk.END, " ")
-                    self._chat_text.window_create(tk.END, window=btn)
-                    self._chat_text.insert(tk.END, "\n")
-                else:
-                    self._chat_text.insert(tk.END, "\n")
+                        self._chat_text.insert(tk.END, "\n")
+                except Exception:
+                    # 单条渲染失败不影响其余消息，至少插入占位
+                    try:
+                        self._chat_text.insert(tk.END, "(该条无法显示)\n")
+                    except Exception:
+                        pass
             self._chat_text.see(tk.END)
             # 自动播放：若本条是刚追加的带音频消息，立即播放
             pending = self.state.get_and_clear_pending_play_audio()

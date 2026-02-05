@@ -125,6 +125,8 @@ def main() -> int:
                     if _chat_window is not None:
                         _chat_window.update_from_state()
                         _chat_window.update()
+                    if state.get_quit_requested():
+                        break
                     continue
 
             if not camera_wanted:
@@ -139,6 +141,8 @@ def main() -> int:
                 if _chat_window is not None:
                     _chat_window.update_from_state()
                     _chat_window.update()
+                if state.get_quit_requested():
+                    break
                 if key == ord("q") or key == ord("Q"):
                     break
                 now = time.monotonic()
@@ -155,6 +159,7 @@ def main() -> int:
                     cap = None
                     continue
                 cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(win, config.CAMERA_WIDTH, config.CAMERA_HEIGHT)
                 retries_left = getattr(config, "CAMERA_REOPEN_RETRIES", 3)
 
             try:
@@ -234,6 +239,8 @@ def main() -> int:
             if _chat_window is not None:
                 _chat_window.update_from_state()
                 _chat_window.update()
+            if state.get_quit_requested():
+                break
             if key == ord("q") or key == ord("Q"):
                 break
             res = state.get_latest_result()
