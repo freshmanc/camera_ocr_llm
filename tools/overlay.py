@@ -82,6 +82,27 @@ def draw_text_block(
     return img_bgr
 
 
+def _diff_rate(a: str, b: str) -> Optional[float]:
+    """计算两段文字的差别率 0~1：0=完全相同，1=完全不同。基于字符级编辑距离思想。"""
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a and not b:
+        return 0.0
+    n, m = len(a), len(b)
+    if n == 0 or m == 0:
+        return 1.0
+    # 简单 LCS 相似度：最长公共子序列长度 / max(n,m)，差别率 = 1 - 相似度
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    sim = dp[n][m] / max(n, m)
+    return round(1.0 - sim, 4)
+
+
 def build_display_lines(
     raw_ocr: str,
     corrected: str,
@@ -96,24 +117,30 @@ def build_display_lines(
     vision_llm_text: Optional[str] = None,
     cross_validated_text: Optional[str] = None,
 ) -> list:
-    """组装要显示的文本行：原始 OCR、去抖 OCR、纠错后、视觉 LLM、交叉验证、置信度、耗时、FPS、可选错误信息"""
+    """组装要显示的文本行：原始 OCR、去抖 OCR、纠错后、差别率、视觉 LLM、交叉验证、置信度、耗时、FPS、可选错误信息"""
     debounced_s = (debounced_ocr or "").strip()
     debounced_display = (debounced_s[:120] + "..." if len(debounced_s) > 120 else debounced_s) or "(无)"
     lines = [
-        "[原始OCR] " + (raw_ocr[:120] + "..." if len(raw_ocr) > 120 else raw_ocr or "(无)"),
-        "[去抖OCR] " + debounced_display,
-        "[纠错后] " + (corrected[:120] + "..." if len(corrected) > 120 else corrected or "(无)"),
+        "[初始OCR] " + (raw_ocr[:120] + "..." if len(raw_ocr) > 120 else raw_ocr or "(无)"),
+        "[去抖] " + debounced_display,
+        "[校验后] " + (corrected[:120] + "..." if len(corrected) > 120 else corrected or "(无)"),
     ]
+    # 差别率：初始(去抖)与校验后的差异
+    base = debounced_s or raw_ocr or ""
+    cor = (corrected or "").strip()
+    dr = _diff_rate(base, cor)
+    if dr is not None:
+        lines.append(f"[差别率] {dr:.1%}")
     v_llm = (vision_llm_text or "").strip()
     if v_llm:
         lines.append("[Vision LLM] " + (v_llm[:120] + "..." if len(v_llm) > 120 else v_llm))
     cross = (cross_validated_text or "").strip()
-    if cross and cross != (corrected or "").strip():
+    if cross and cross != cor:
         lines.append("[交叉验证] " + (cross[:120] + "..." if len(cross) > 120 else cross))
-    perf_line = f"[耗时] OCR: {ocr_time_ms:.0f}ms  |  LLM: {llm_time_ms:.0f}ms"
+    perf_line = f"[耗时] OCR: {ocr_time_ms:.0f}ms  LLM: {llm_time_ms:.0f}ms"
     if fps is not None:
-        perf_line += f"  |  FPS: {fps:.1f}"
-    perf_line += f"  |  置信度: {confidence:.2%}"
+        perf_line += f"  FPS: {fps:.1f}"
+    perf_line += f"  置信度: {confidence:.2%}"
     lines.append(perf_line)
     if not ocr_ok or not llm_ok or error_msg:
         status = []
@@ -124,6 +151,32 @@ def build_display_lines(
         if error_msg:
             status.append(error_msg[:60])
         lines.append("[状态] " + " | ".join(status))
+    return lines
+
+
+def build_display_lines_compact(
+    raw_ocr: str,
+    corrected: str,
+    confidence: float,
+    ocr_time_ms: float,
+    llm_time_ms: float,
+    fps: Optional[float] = None,
+    debounced_ocr: Optional[str] = None,
+) -> list:
+    """紧凑显示：初始、校验后、差别率、耗时（摄像头角落不挡视线）。"""
+    base = (debounced_ocr or raw_ocr or "").strip()
+    cor = (corrected or "").strip()
+    dr = _diff_rate(base, cor)
+    lines = [
+        "[初始] " + ((base[:60] + "…") if len(base) > 60 else base or "(无)"),
+        "[校验] " + ((cor[:60] + "…") if len(cor) > 60 else cor or "(无)"),
+    ]
+    if dr is not None:
+        lines.append(f"[差别率] {dr:.1%}")
+    perf = f"OCR:{ocr_time_ms:.0f}ms LLM:{llm_time_ms:.0f}ms 置信:{confidence:.0%}"
+    if fps is not None:
+        perf += f" FPS:{fps:.1f}"
+    lines.append(perf)
     return lines
 
 

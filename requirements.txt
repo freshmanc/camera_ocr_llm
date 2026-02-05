@@ -17,3 +17,7 @@ openai>=1.0.0
 # 语音朗读（朗读 Agent：自动英/法检测 + edge-tts）
 edge-tts>=6.1.0
 langdetect>=1.0.9
+
+# 可选：上传 PDF/Word、生成试卷 PDF/Word
+# pdfplumber 或 PyPDF2（上传 PDF）；python-docx（上传 Word、生成 Word 试卷）；fpdf2（生成 PDF 试卷）
+# pip install pdfplumber python-docx fpdf2

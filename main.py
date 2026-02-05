@@ -24,7 +24,7 @@ os.environ.setdefault("FLAGS_use_onednn", "0")
 import cv2  # type: ignore[import-untyped]
 import numpy as np
 import config
-from tools.overlay import build_display_lines, draw_text_block, wrap_text_for_display
+from tools.overlay import build_display_lines, build_display_lines_compact, draw_text_block, wrap_text_for_display
 from shared_state import SharedState
 from worker import start_worker
 from tools.logger_util import log, log_metrics, save_debug_frame
@@ -33,6 +33,11 @@ from tools.ocr_engine import init_paddle_ocr_engine
 
 # 白底黑字可交互对话窗口（打字 + 小麦克风）
 _chat_window = None
+# 摄像头隐藏时的占位图（仅用于 show_camera_window 隐藏时的占位）
+_placeholder_frame = None
+
+# 摄像头窗口标题（仅在实际打开摄像头时创建/显示，关闭时销毁）
+_CAMERA_WIN_NAME = "Camera OCR + LLM"
 
 
 def _open_camera():
@@ -57,12 +62,11 @@ def main() -> int:
         os.makedirs(log_dir, exist_ok=True)
     except Exception:
         pass
-    log("正在打开摄像头...")
-    cap = _open_camera()
-    if not cap.isOpened():
-        log("无法打开摄像头，请检查设备或 CAMERA_INDEX", level="ERROR")
-        return 1
     state = SharedState(fusion_frames=getattr(config, "OCR_FUSION_FRAMES", 0))
+    state.set_show_camera_window(getattr(config, "CAMERA_WINDOW_START_VISIBLE", True))
+    # 按需启停：默认不打开摄像头，按 C 键或点对话窗口按钮再开
+    state.set_camera_wanted(not getattr(config, "CAMERA_START_OFF", True))
+    cap = None
     metrics = Metrics()
     try:
         if not init_paddle_ocr_engine():
@@ -70,9 +74,10 @@ def main() -> int:
     except Exception as e:
         log(f"PaddleOCR 预初始化异常（OCR 可能不可用）: {e}", level="WARNING")
     start_worker(state, metrics)
-    log("后台 OCR+LLM 已启动；主线程仅刷新画面。按 Q 退出。")
-    win = "Camera OCR + LLM"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    key_toggle = getattr(config, "KEY_TOGGLE_CAMERA", ord("c"))
+    log("后台已启动。按 C 键或点对话窗口「打开/关闭摄像头」启停识别，按 Q 退出。")
+    win = _CAMERA_WIN_NAME
+    # 摄像头窗口不在此创建，在首次打开摄像头时再创建，关闭时销毁
     if getattr(config, "ENABLE_VOICE_ASSISTANT", False):
         # 按路径强制加载本项目的 tools，避免被 site-packages 里的 tools 顶掉
         import importlib.util
@@ -99,6 +104,59 @@ def main() -> int:
     retries_left = getattr(config, "CAMERA_REOPEN_RETRIES", 3)
     try:
         while True:
+            if state.get_quit_requested():
+                break
+            camera_wanted = state.get_camera_wanted()
+            key = cv2.waitKey(1) & 0xFF
+
+            # 按 C 键切换摄像头开关
+            if key == key_toggle or key == key_toggle - 32:
+                state.set_camera_wanted(not camera_wanted)
+                camera_wanted = state.get_camera_wanted()
+                log("摄像头已开启" if camera_wanted else "摄像头已关闭")
+                if not camera_wanted:
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                    try:
+                        cv2.destroyWindow(win)
+                    except Exception:
+                        pass
+                    if _chat_window is not None:
+                        _chat_window.update_from_state()
+                        _chat_window.update()
+                    continue
+
+            if not camera_wanted:
+                # 未开启：确保设备与窗口已释放/关闭
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                try:
+                    cv2.destroyWindow(win)
+                except Exception:
+                    pass
+                if _chat_window is not None:
+                    _chat_window.update_from_state()
+                    _chat_window.update()
+                if key == ord("q") or key == ord("Q"):
+                    break
+                now = time.monotonic()
+                if now - last_metrics_time >= getattr(config, "METRICS_LOG_INTERVAL_SEC", 30):
+                    last_metrics_time = now
+                continue
+
+            # 需要摄像头：若未打开则打开，并创建窗口
+            if cap is None:
+                cap = _open_camera()
+                if not cap.isOpened():
+                    log("无法打开摄像头，请检查设备或 CAMERA_INDEX", level="ERROR")
+                    state.set_camera_wanted(False)
+                    cap = None
+                    continue
+                cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                retries_left = getattr(config, "CAMERA_REOPEN_RETRIES", 3)
+
             try:
                 ret, frame = cap.read()
             except Exception as e:
@@ -109,9 +167,11 @@ def main() -> int:
                 log("读取帧失败，尝试重连摄像头...", level="ERROR")
                 save_debug_frame(None, "camera_lost")
                 cap.release()
+                cap = None
                 if retries_left <= 0:
-                    log("摄像头重连次数用尽，退出", level="ERROR")
-                    break
+                    log("摄像头重连次数用尽，已关闭", level="ERROR")
+                    state.set_camera_wanted(False)
+                    continue
                 time.sleep(getattr(config, "CAMERA_REOPEN_DELAY_SEC", 2))
                 cap = _open_camera()
                 if not cap.isOpened():
@@ -123,33 +183,59 @@ def main() -> int:
                 metrics.tick_frame()
                 state.set_frame(frame)
                 res = state.get_latest_result()
-                lines = build_display_lines(
-                    res.raw_ocr,
-                    res.corrected,
-                    res.confidence,
-                    res.ocr_time_ms,
-                    res.llm_time_ms,
-                    res.ocr_ok,
-                    res.llm_ok,
-                    res.error_msg,
-                    fps=last_fps,
-                    debounced_ocr=res.debounced_ocr,
-                    vision_llm_text=res.vision_llm_text or None,
-                    cross_validated_text=res.cross_validated_text or None,
-                )
-                frame = draw_text_block(frame, lines, x=10, y=10, font_size=18, color_bgr=(0, 255, 0))
-                cv2.imshow(win, frame)
-                # 白底黑字对话窗口：每帧刷新并处理事件
-                if _chat_window is not None:
-                    _chat_window.update_from_state()
-                    _chat_window.update()
+                display_mode = getattr(config, "OCR_DISPLAY_ON_CAMERA", "full") or "full"
+                if display_mode == "none":
+                    lines = []
+                elif display_mode == "minimal":
+                    lines = build_display_lines_compact(
+                        res.raw_ocr,
+                        res.corrected,
+                        res.confidence,
+                        res.ocr_time_ms,
+                        res.llm_time_ms,
+                        fps=last_fps,
+                        debounced_ocr=res.debounced_ocr,
+                    )
+                    h, w = frame.shape[:2]
+                    frame = draw_text_block(frame, lines, x=max(10, w - 520), y=max(10, h - 80), font_size=14, color_bgr=(0, 255, 0))
+                else:
+                    lines = build_display_lines(
+                        res.raw_ocr,
+                        res.corrected,
+                        res.confidence,
+                        res.ocr_time_ms,
+                        res.llm_time_ms,
+                        res.ocr_ok,
+                        res.llm_ok,
+                        res.error_msg,
+                        fps=last_fps,
+                        debounced_ocr=res.debounced_ocr,
+                        vision_llm_text=res.vision_llm_text or None,
+                        cross_validated_text=res.cross_validated_text or None,
+                    )
+                    frame = draw_text_block(frame, lines, x=10, y=10, font_size=18, color_bgr=(0, 255, 0))
+                show_camera = state.get_show_camera_window()
+                if show_camera:
+                    cv2.imshow(win, frame)
+                else:
+                    global _placeholder_frame
+                    if _placeholder_frame is None or _placeholder_frame.shape[:2] != frame.shape[:2]:
+                        _placeholder_frame = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
+                        _placeholder_frame[:] = (36, 36, 36)
+                        _placeholder_frame = draw_text_block(
+                            _placeholder_frame,
+                            ["摄像头已隐藏", "点击对话窗口「打开摄像头」恢复识别"],
+                            x=24, y=24, font_size=20, color_bgr=(180, 180, 180),
+                        )
+                    cv2.imshow(win, _placeholder_frame)
             except Exception as e:
                 log(f"主循环单帧异常: {e}", level="ERROR")
                 save_debug_frame(frame, "frame_error")
-            key = cv2.waitKey(1) & 0xFF
+            if _chat_window is not None:
+                _chat_window.update_from_state()
+                _chat_window.update()
             if key == ord("q") or key == ord("Q"):
                 break
-            # 用户指令：用当前纠错后内容执行读/翻译/读音/例句（无内容时仅朗读可触发，其余不请求 LLM）
             res = state.get_latest_result()
             content = (res.corrected or res.debounced_ocr or "").strip()
             key_r = getattr(config, "KEY_READ", ord("r"))
@@ -180,7 +266,12 @@ def main() -> int:
                 _chat_window.destroy()
             except Exception:
                 pass
-        cap.release()
+        if cap is not None:
+            cap.release()
+        try:
+            cv2.destroyWindow(win)
+        except Exception:
+            pass
         cv2.destroyAllWindows()
     return 0
 

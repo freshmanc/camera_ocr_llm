@@ -55,6 +55,30 @@ class SharedState:
         self._last_read_content: str = ""
         # 流式回复：当前正在接收的助手内容，get_chat_history 会把它合并到最后一条 assistant 显示
         self._streaming_text: Optional[str] = None
+        # 摄像头窗口是否显示实时画面（False 时主循环显示占位图，对话窗口可点「打开摄像头」恢复）
+        self._show_camera_window: bool = True
+        # 是否开启摄像头与识别：False=不打开设备、不识别；按按键或点按钮切换
+        self._camera_wanted: bool = False
+        # 用户上传文件：下一次发消息时会附带给 LLM，用后清空
+        self._uploaded_file_name: Optional[str] = None
+        self._uploaded_file_content: Optional[str] = None
+        # 最近一次生成的试卷与答案路径，供「批改试卷」时使用
+        self._last_exam_paper_path: Optional[str] = None
+        self._last_exam_answer_key_path: Optional[str] = None
+        # 截图识别：提交一帧做一次 OCR+LLM，后台取走后清空
+        self._pending_screenshot: Optional[np.ndarray] = None
+        # 语音助手窗口关闭时设为 True，主循环据此退出
+        self._quit_requested: bool = False
+
+    def set_quit_requested(self, value: bool = True) -> None:
+        """语音助手窗口关闭时调用，主循环检测后退出。"""
+        with self._lock:
+            self._quit_requested = value
+
+    def get_quit_requested(self) -> bool:
+        """主循环每轮检查，为 True 时退出。"""
+        with self._lock:
+            return self._quit_requested
 
     def append_chat(self, role: str, text: str, audio_path: Optional[str] = None) -> None:
         """后台线程：追加一条对话（user 或 assistant），带时间戳；可选附带朗读音频路径（会触发自动播放）。"""
@@ -116,6 +140,32 @@ class SharedState:
         with self._lock:
             return self._streaming_text
 
+    def get_show_camera_window(self) -> bool:
+        """主线程：是否在摄像头窗口显示实时画面（否则显示占位）。"""
+        with self._lock:
+            return self._show_camera_window
+
+    def set_show_camera_window(self, show: bool) -> None:
+        """主线程/对话窗口：切换摄像头窗口显示实时画面或占位。"""
+        with self._lock:
+            self._show_camera_window = bool(show)
+
+    def get_camera_wanted(self) -> bool:
+        """是否开启摄像头与识别（按按键或点按钮切换）。"""
+        with self._lock:
+            return self._camera_wanted
+
+    def set_camera_wanted(self, wanted: bool) -> None:
+        """设置是否开启摄像头与识别。"""
+        with self._lock:
+            self._camera_wanted = bool(wanted)
+
+    def toggle_camera_wanted(self) -> bool:
+        """切换摄像头开关状态，返回切换后的状态。"""
+        with self._lock:
+            self._camera_wanted = not self._camera_wanted
+            return self._camera_wanted
+
     def finish_streaming(self, final_text: str) -> None:
         """后台：结束流式，将最后一条 assistant 设为最终内容并清空 _streaming_text。"""
         with self._lock:
@@ -133,6 +183,36 @@ class SharedState:
                 max_len = 64
             if len(self._chat_history) > max_len:
                 self._chat_history = self._chat_history[-max_len:]
+
+    def set_uploaded_file(self, name: str, content: str) -> None:
+        """主线程：用户上传文件后调用，供下一次对话附带给 LLM。"""
+        with self._lock:
+            self._uploaded_file_name = (name or "").strip() or None
+            self._uploaded_file_content = (content or "").strip() or None
+
+    def get_uploaded_file(self) -> Tuple[Optional[str], Optional[str]]:
+        """后台线程：获取当前上传的文件名与内容（不清空）。返回 (name, content)。"""
+        with self._lock:
+            return self._uploaded_file_name, self._uploaded_file_content
+
+    def get_and_clear_uploaded_file(self) -> Tuple[Optional[str], Optional[str]]:
+        """后台线程：取走上传的文件名与内容，取后清空。返回 (name, content)。"""
+        with self._lock:
+            name, content = self._uploaded_file_name, self._uploaded_file_content
+            self._uploaded_file_name = None
+            self._uploaded_file_content = None
+            return name, content
+
+    def set_last_exam_paths(self, paper_path: Optional[str], answer_key_path: Optional[str]) -> None:
+        """后台：保存最近一次生成的试卷与答案路径，供批改时使用。"""
+        with self._lock:
+            self._last_exam_paper_path = (paper_path or "").strip() or None
+            self._last_exam_answer_key_path = (answer_key_path or "").strip() or None
+
+    def get_last_exam_paths(self) -> Tuple[Optional[str], Optional[str]]:
+        """后台：获取最近一次试卷与答案路径。返回 (paper_path, answer_key_path)。"""
+        with self._lock:
+            return self._last_exam_paper_path, self._last_exam_answer_key_path
 
     def set_pending_chat(self, message: str) -> None:
         """主线程：用户输入/语音识别后，提交给助手。"""
@@ -222,6 +302,25 @@ class SharedState:
             self._current_frame = frame
             self._frame_count += 1
             self._frame_buffer.append(frame.copy())
+
+    def get_current_frame(self) -> Optional[np.ndarray]:
+        """主线程/截图按钮：获取当前最新帧副本；无帧时返回 None。"""
+        with self._lock:
+            if self._current_frame is None:
+                return None
+            return self._current_frame.copy()
+
+    def set_pending_screenshot(self, frame: np.ndarray) -> None:
+        """主线程：提交一帧做「截图识别」，后台将对该帧做一次 OCR+LLM 并更新结果。"""
+        with self._lock:
+            self._pending_screenshot = frame.copy()
+
+    def get_and_clear_pending_screenshot(self) -> Optional[np.ndarray]:
+        """后台线程：取走待识别的截图帧，取后清空。"""
+        with self._lock:
+            out = self._pending_screenshot
+            self._pending_screenshot = None
+            return out
 
     def get_frame_for_ocr(
         self,

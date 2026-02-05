@@ -126,23 +126,70 @@ def _is_thinking_truncated(reply: str) -> bool:
     return False
 
 
+def _direct_llm_system_prompt() -> str:
+    """直接对话模式下的系统提示：法语教学模式优先用专家人设，否则用 VOICE_ASSISTANT_SYSTEM_DIRECT 或默认。"""
+    custom = (getattr(config, "VOICE_ASSISTANT_SYSTEM_DIRECT", "") or "").strip()
+    if custom:
+        return custom
+    if getattr(config, "FRENCH_TEACHING_MODE", False):
+        expert = (getattr(config, "FRENCH_EXPERT_SYSTEM_PROMPT", "") or "").strip()
+        if expert:
+            return expert
+    return (
+        "你是摄像头 OCR 应用的对话助手。用户可能让你翻译当前画面文字、读读音、举例句或随便聊天。"
+        "下面会提供「当前画面识别的文字」供参考（若无则显示暂无）。请直接、自然地回复，不要输出任何 [ACTION:xxx] 标签。"
+    )
+
+
+def _build_direct_memory() -> str:
+    """拼装直接对话的长期记忆：config.VOICE_ASSISTANT_MEMORY + 法语教学学情文件内容。"""
+    memory = (getattr(config, "VOICE_ASSISTANT_MEMORY", "") or "").strip()
+    if getattr(config, "FRENCH_TEACHING_MODE", False):
+        try:
+            from agents.learning_context import get_learning_summary_for_prompt
+            summary = get_learning_summary_for_prompt()
+            if summary:
+                memory = (memory + "\n\n【学情摘要】\n" + summary).strip() if memory else ("【学情摘要】\n" + summary)
+        except Exception:
+            pass
+    return memory
+
+
+def _build_user_message(
+    user_message: str,
+    current_ocr_content: str,
+    uploaded_file_name: Optional[str] = None,
+    uploaded_file_content: Optional[str] = None,
+    uploaded_max_chars: int = 8000,
+) -> str:
+    """拼装发给 LLM 的用户内容：可选上传文件 + 当前画面 + 用户说。"""
+    parts = []
+    if (uploaded_file_name or "").strip() and (uploaded_file_content or "").strip():
+        content = (uploaded_file_content or "").strip()
+        if len(content) > uploaded_max_chars:
+            content = content[:uploaded_max_chars] + "\n\n…（已截断）"
+        parts.append(f"【用户上传文件】文件名: {uploaded_file_name.strip()}\n内容：\n{content}")
+    ctx = (current_ocr_content or "").strip() or "（暂无）"
+    parts.append(f"【当前画面文字】\n{ctx}\n\n用户说：{(user_message or '').strip()}")
+    return "\n\n".join(parts)
+
+
 def chat_direct_llm(
     user_message: str,
     recent_history: Optional[List[Tuple[str, str]]] = None,
     current_ocr_content: str = "",
+    uploaded_file_name: Optional[str] = None,
+    uploaded_file_content: Optional[str] = None,
 ) -> str:
     """
-    直接对接 LLM：把用户消息和对话历史发给模型，附带当前画面文字供参考，返回模型回复原文。
+    直接对接 LLM：把用户消息和对话历史发给模型，附带当前画面文字（及可选上传文件）供参考，返回模型回复原文。
     不做 [ACTION:xxx] 解析，对话窗口只做中转。
     """
     user_message = (user_message or "").strip()
     if not user_message:
         return "（请说点什么）"
-    sys_prompt = (
-        "你是摄像头 OCR 应用的对话助手。用户可能让你翻译当前画面文字、读读音、举例句或随便聊天。"
-        "下面会提供「当前画面识别的文字」供参考（若无则显示暂无）。请直接、自然地回复，不要输出任何 [ACTION:xxx] 标签。"
-    )
-    memory = (getattr(config, "VOICE_ASSISTANT_MEMORY", "") or "").strip()
+    sys_prompt = _direct_llm_system_prompt()
+    memory = _build_direct_memory()
     if memory:
         sys_prompt = sys_prompt.rstrip() + "\n\n【长期记忆】\n" + memory
     timeout = getattr(config, "VOICE_ASSISTANT_TIMEOUT_SEC", 90)
@@ -155,8 +202,9 @@ def chat_direct_llm(
     if recent_history:
         for role, text in recent_history[-context_n:]:
             messages.append({"role": role, "content": text})
-    ctx = (current_ocr_content or "").strip() or "（暂无）"
-    user_with_ctx = f"【当前画面文字】\n{ctx}\n\n用户说：{user_message}"
+    user_with_ctx = _build_user_message(
+        user_message, current_ocr_content, uploaded_file_name, uploaded_file_content
+    )
     messages.append({"role": "user", "content": user_with_ctx})
     try:
         client, model_id = _get_voice_client_and_model()
@@ -181,19 +229,18 @@ def chat_direct_llm_stream(
     recent_history: Optional[List[Tuple[str, str]]] = None,
     current_ocr_content: str = "",
     on_chunk: Optional[Callable[[str], None]] = None,
+    uploaded_file_name: Optional[str] = None,
+    uploaded_file_content: Optional[str] = None,
 ) -> str:
     """
     直接对接 LLM 并流式返回：每收到一块内容就调用 on_chunk(delta)，主线程可据此刷新对话窗口。
-    返回完整回复；异常时返回错误信息字符串。
+    可选附带用户上传文件内容。返回完整回复；异常时返回错误信息字符串。
     """
     user_message = (user_message or "").strip()
     if not user_message:
         return "（请说点什么）"
-    sys_prompt = (
-        "你是摄像头 OCR 应用的对话助手。用户可能让你翻译当前画面文字、读读音、举例句或随便聊天。"
-        "下面会提供「当前画面识别的文字」供参考（若无则显示暂无）。请直接、自然地回复，不要输出任何 [ACTION:xxx] 标签。"
-    )
-    memory = (getattr(config, "VOICE_ASSISTANT_MEMORY", "") or "").strip()
+    sys_prompt = _direct_llm_system_prompt()
+    memory = _build_direct_memory()
     if memory:
         sys_prompt = sys_prompt.rstrip() + "\n\n【长期记忆】\n" + memory
     timeout = getattr(config, "VOICE_ASSISTANT_TIMEOUT_SEC", 90)
@@ -206,8 +253,9 @@ def chat_direct_llm_stream(
     if recent_history:
         for role, text in recent_history[-context_n:]:
             messages.append({"role": role, "content": text})
-    ctx = (current_ocr_content or "").strip() or "（暂无）"
-    user_with_ctx = f"【当前画面文字】\n{ctx}\n\n用户说：{user_message}"
+    user_with_ctx = _build_user_message(
+        user_message, current_ocr_content, uploaded_file_name, uploaded_file_content
+    )
     messages.append({"role": "user", "content": user_with_ctx})
     try:
         client, model_id = _get_voice_client_and_model()

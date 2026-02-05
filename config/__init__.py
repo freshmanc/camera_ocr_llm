@@ -9,6 +9,13 @@ _ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
+# 启动时是否显示摄像头实时画面；False 则只显示占位，可在对话窗口点「打开摄像头」调出
+CAMERA_WINDOW_START_VISIBLE = True
+# 按需启停：按此键或点对话窗口「打开/关闭摄像头」切换，默认不打开摄像头（避免报错）
+KEY_TOGGLE_CAMERA = ord("c")   # C 键
+CAMERA_START_OFF = True       # True=启动时不打开摄像头，按 C 或点按钮再开
+# 识别文字在摄像头画面上的显示方式：full=全文叠加 minimal=仅角落一两行不挡视线 none=不叠加（全文在对话窗口「当前识别」看）
+OCR_DISPLAY_ON_CAMERA = "minimal"
 FRAME_SKIP = 2  # 每 N 帧做一次 OCR；2=隔帧识别，减少抖动、提高稳定；1=每帧（更灵敏但易晃）
 
 # 多帧融合 + 稳定后才 OCR（开太猛会几乎不识别，先关掉或放宽）
@@ -105,7 +112,11 @@ CHAT_WINDOW_WIDTH = 520
 CHAT_WINDOW_HEIGHT = 420
 CHAT_HISTORY_MAX = 64          # 保留最近 N 条对话（短期记忆，用户+助手各算一条）
 VOICE_ASSISTANT_CONTEXT_MESSAGES = 24   # 传给 LLM 的最近对话条数，便于理解上下文
-VOICE_ASSISTANT_MEMORY = ""    # 长期记忆：写在这里的内容会追加到系统提示，LLM 始终可见（如「用户常读法语」）
+VOICE_ASSISTANT_MEMORY = ""    # 长期记忆：写在这里的内容会追加到系统提示，LLM 始终可见（如学情摘要、学生水平）
+# 直接对话模式下的系统人设（VOICE_ASSISTANT_DIRECT_LLM=True 时用）。空则用默认通用助手。
+# 法语教学专家示例见 docs/PRODUCT_VISION_FRENCH_EXPERT.md，复制到下面并去掉三引号即可启用。
+# VOICE_ASSISTANT_SYSTEM_DIRECT = """你是一位耐心的法语教学专家..."""
+VOICE_ASSISTANT_SYSTEM_DIRECT = ""
 KEY_CHAT_INPUT = ord("i")      # I = 弹出文字输入框，与助手对话
 KEY_VOICE_INPUT = ord("v")     # V = 语音输入（需安装 SpeechRecognition + pyaudio）
 # 语音识别引擎：google=谷歌网页 API（需联网）；whisper=本地 Whisper（更准、可离线，需 pip install openai-whisper）
@@ -143,7 +154,23 @@ VOICE_ASSISTANT_SYSTEM = """你是摄像头 OCR 应用的语音助手。用户�
 
 示例：用户说「翻译」→ 你只回复：好的，正在翻译。\n[ACTION:translate]。用户说「翻译之前的句子」→ 你只回复：好的，正在翻译上一句。\n[ACTION:translate_previous]"""
 
-# 对话框内展示给用户的功能说明（无对话时显示）
+# ========== 法语教学系统（复用上述 OCR / 语音助手 / TTS / 翻译 等）==========
+# True=启用法语教学专家人设 + 学情文件；助手会结合「当前画面」与学情做讲解、问答、考核与评价
+FRENCH_TEACHING_MODE = True
+# 学情记录文件路径（相对项目根）：内容会作为【学情摘要】注入助手长期记忆；可说「记录学情」把当前/上一句写入
+FRENCH_TEACHING_LEARNING_FILE = "logs/learning_context.txt"
+# 法语教学专家系统提示（FRENCH_TEACHING_MODE=True 且 VOICE_ASSISTANT_SYSTEM_DIRECT 为空时使用）
+FRENCH_EXPERT_SYSTEM_PROMPT = """你是一位耐心的法语教学专家，面向中文母语学生。你能「看见」学生摄像头拍到的法语材料（系统会提供「当前画面文字」）。
+
+你的能力：
+- 对看见的法语进行讲解：语法、词汇、发音要点、常见错误。学生说「精讲」「翻译」「读音」「例句」时请结合画面作答。
+- 用中文或中法混合回答学生问题（语音或打字均可）。
+- 根据对话和「长期记忆」中的学情摘要，简要了解学生进度与薄弱点。
+- 可应学生要求做简单考核或学习建议（如「考考我」「给我评价」：根据当前画面或最近内容提问、或给一句评价与下一步建议）。
+
+回复请自然、简洁、有针对性；若当前画面有法语内容，可结合画面作答。"""
+
+# 对话框内展示给用户的功能说明（无对话时显示）；法语教学模式下会追加学情与考核说明
 DIALOG_FEATURE_PROMPT = """【可用功能】摄像头会实时识别画面中的文字，您可以说或输入：
 
 · 读一下 / 读出来 / 读一下视频 —— 朗读当前识别文字，对话中会显示【内容】和「播放」按钮
@@ -153,6 +180,23 @@ DIALOG_FEATURE_PROMPT = """【可用功能】摄像头会实时识别画面中�
 · 把识别到的文字发到这里 / 发到对话框 —— 将当前识别结果显示在对话中
 
 操作方式：下方输入框打字后点「发送」或回车；或按住「语音」说话，松开结束。"""
+# 法语教学模式下追加的说明（与上面拼接后显示）
+DIALOG_FRENCH_TEACHING_PROMPT = """
+
+【法语教学】老师会结合当前画面与你的学情作答。你还可以说：
+· 精讲 / 精讲刚识别的 —— 对当前画面法语做语法、词汇、用法讲解
+· 考考我 / 给我评价 —— 根据当前或最近内容做简单考核或学习评价
+· 记录学情 / 记下来 —— 把当前或上一句内容记入学情，方便老师后续参考
+· 出卷子 / 生成试卷 —— 根据当前画面或上传材料生成 TXT/PDF/Word 试卷（答案另存）
+· 批改试卷 —— 上传你的答案文件后说「批改试卷」，系统会批改并讲解
+· 点击「上传」可上传 TXT/PDF/Word，老师会结合文件内容回答或出题"""
+
+# 考试功能：生成试卷（TXT/PDF/Word）、批改、讲解
+EXAM_OUTPUT_DIR = "logs/exams"
+EXAM_DEFAULT_FORMAT = "txt"   # txt | pdf | docx
+EXAM_NUM_QUESTIONS = 5
+EXAM_LLM_TIMEOUT_SEC = 60
+EXAM_LLM_MAX_TOKENS = 1500
 
 # 视觉 LLM：用本地/云端视觉模型从截图提取文字，与 OCR 交叉验证
 ENABLE_VISION_LLM = False   # 需视觉模型（如 gpt-4o / Qwen-VL / LLaVA），LM Studio 需加载视觉模型

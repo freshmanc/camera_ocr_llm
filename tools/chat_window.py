@@ -42,6 +42,8 @@ class ChatWindow:
         self._voice_recording = False
         self._play_tag_to_path: dict = {}
         self._last_history_sig: Optional[str] = None  # 仅当对话变化时重绘，避免每帧刷新
+        self._camera_btn: Optional[tk.Button] = None  # 打开/隐藏摄像头，需根据 state 更新文案
+        self._ocr_label: Optional[tk.Label] = None    # 当前识别全文，减少画面遮挡时在此查看
 
     def set_content_for_command_callback(self, fn: Callable[[], str]) -> None:
         """可选：用于语音指令取当前识别内容（与 worker 一致）。"""
@@ -51,13 +53,31 @@ class ChatWindow:
         self._root = tk.Tk()
         self._root.title(self.title)
         self._root.configure(bg="#ffffff")
-        self._root.geometry("500x480+80+80")
-        self._root.minsize(380, 400)
+        self._root.geometry("620x680+80+60")
+        self._root.minsize(520, 520)
+        # 关闭本窗口时通知主程序退出（主程序以语音助手窗口为主窗口）
+        self._root.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
         # 先放底部栏，保证输入框和「语音」始终在窗口底部可见
         bottom = tk.Frame(self._root, bg="#ffffff", height=56)
         bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
         bottom.pack_propagate(False)
+
+        # 顶部：当前识别全文（设为 minimal/none 时在此查看，不挡摄像头）
+        ocr_frame = tk.Frame(self._root, bg="#f5f5f5", height=52)
+        ocr_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(8, 0))
+        ocr_frame.pack_propagate(False)
+        self._ocr_label = tk.Label(
+            ocr_frame,
+            text="当前识别：（无）",
+            font=("Microsoft YaHei UI", 10),
+            bg="#f5f5f5",
+            fg="#333333",
+            anchor="nw",
+            justify=tk.LEFT,
+            wraplength=580,
+        )
+        self._ocr_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 聊天区域在上方，填充剩余空间
         chat_frame = tk.Frame(self._root, bg="#ffffff")
@@ -124,6 +144,57 @@ class ChatWindow:
         mic_btn.bind("<ButtonRelease-1>", lambda e: self._on_mic_release())
         mic_btn.pack(side=tk.LEFT)
 
+        # 上传文件（.txt / .pdf / .docx），内容会在下次发消息时一并发给 LLM
+        upload_btn = tk.Button(
+            bottom,
+            text="上传",
+            font=("Microsoft YaHei UI", 10),
+            bg="#e8f5e9",
+            fg="#000000",
+            activebackground="#c8e6c9",
+            relief=tk.RAISED,
+            bd=1,
+            padx=10,
+            pady=6,
+            cursor="hand2",
+            command=self._on_upload,
+        )
+        upload_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        # 打开/关闭摄像头与识别（按需启停，避免启动时报错）
+        self._camera_btn = tk.Button(
+            bottom,
+            text="打开摄像头",
+            font=("Microsoft YaHei UI", 10),
+            bg="#fff3e0",
+            fg="#000000",
+            activebackground="#ffe0b2",
+            relief=tk.RAISED,
+            bd=1,
+            padx=8,
+            pady=6,
+            cursor="hand2",
+            command=self._on_toggle_camera,
+        )
+        self._camera_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        # 截图识别：当前画面或选择图片，做一次 OCR+LLM 双重校验
+        screenshot_btn = tk.Button(
+            bottom,
+            text="截图识别",
+            font=("Microsoft YaHei UI", 10),
+            bg="#e3f2fd",
+            fg="#000000",
+            activebackground="#bbdefb",
+            relief=tk.RAISED,
+            bd=1,
+            padx=8,
+            pady=6,
+            cursor="hand2",
+            command=self._on_screenshot_recognize,
+        )
+        screenshot_btn.pack(side=tk.LEFT, padx=(0, 4))
+
         # 窗口置前并让输入框获得焦点，便于直接打字
         self._root.lift()
         self._root.attributes("-topmost", True)
@@ -138,6 +209,85 @@ class ChatWindow:
                 self._entry.focus_set()
             except tk.TclError:
                 pass
+
+    def _on_window_close(self) -> None:
+        """用户点击关闭按钮：通知主程序退出并销毁本窗口。"""
+        try:
+            self.state.set_quit_requested(True)
+        except Exception:
+            pass
+        try:
+            if self._root and self._root.winfo_exists():
+                self._root.destroy()
+        except Exception:
+            pass
+
+    def _on_toggle_camera(self) -> None:
+        """切换摄像头与识别的启停：按需打开/关闭设备。"""
+        try:
+            on = self.state.toggle_camera_wanted()
+            if self._camera_btn:
+                self._camera_btn.config(text="关闭摄像头" if on else "打开摄像头")
+        except Exception:
+            pass
+
+    def _on_screenshot_recognize(self) -> None:
+        """截图识别：有当前画面则用当前帧，否则选图片文件，提交做一次 OCR+LLM。"""
+        try:
+            frame = self.state.get_current_frame()
+            if frame is None:
+                from tkinter import filedialog
+                path = filedialog.askopenfilename(
+                    title="选择图片（将做 OCR+LLM 识别）",
+                    filetypes=[
+                        ("图片", "*.png;*.jpg;*.jpeg;*.bmp;*.webp"),
+                        ("全部", "*.*"),
+                    ],
+                )
+                if not path:
+                    return
+                import cv2
+                frame = cv2.imread(path)
+                if frame is None:
+                    self.state.append_chat("assistant", "（无法读取该图片，请换一张）")
+                    return
+            self.state.set_pending_screenshot(frame)
+            self.state.append_chat("assistant", "已提交截图，正在 OCR+LLM 识别…")
+            self._last_history_len = -1
+        except Exception as e:
+            try:
+                self.state.append_chat("assistant", "（截图识别失败: " + str(e)[:60] + "）")
+            except Exception:
+                pass
+
+    def _on_upload(self) -> None:
+        """选择 .txt / .pdf / .docx 文件，读取后设为「上传文件」，下次发消息时一并发给 LLM。"""
+        try:
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                title="选择文件（将供老师/LLM 识别）",
+                filetypes=[
+                    ("文本 / PDF / Word", "*.txt;*.pdf;*.docx;*.doc"),
+                    ("文本", "*.txt"),
+                    ("PDF", "*.pdf"),
+                    ("Word", "*.docx;*.doc"),
+                    ("全部", "*.*"),
+                ],
+            )
+            if not path:
+                return
+            from tools.file_util import read_file_as_text
+            ok, text_or_err = read_file_as_text(path)
+            if not ok:
+                self.state.append_chat("assistant", f"（上传失败: {text_or_err}）")
+            else:
+                name = os.path.basename(path)
+                self.state.set_uploaded_file(name, text_or_err)
+                self.state.append_chat("assistant", f"已收到文件「{name}」，请说或输入你的问题（如：翻译、精讲、根据文件出题等）。")
+            self._last_history_len = -1
+        except Exception as e:
+            self.state.append_chat("assistant", f"（上传异常: {str(e)[:60]}）")
+            self._last_history_len = -1
 
     def _on_send(self) -> None:
         if not self._entry:
@@ -300,10 +450,26 @@ class ChatWindow:
         threading.Thread(target=_do, daemon=True).start()
 
     def update_from_state(self) -> None:
-        """主循环每帧调用：仅当对话变化时重绘，避免不停刷新；带音频的消息显示「🔊 播放」可点击。"""
+        """主循环每帧调用：仅当对话变化时重绘，避免不停刷新；带音频的消息显示「🔊 播放」可点击；更新摄像头按钮与当前识别。"""
         if not self._root or not self._chat_text:
             return
         try:
+            # 更新「打开/关闭摄像头」按钮文案（与主循环的启停一致）
+            if self._camera_btn:
+                try:
+                    on = self.state.get_camera_wanted()
+                    self._camera_btn.config(text="关闭摄像头" if on else "打开摄像头")
+                except Exception:
+                    pass
+            # 更新「当前识别」区域（全文在此显示时可减少画面遮挡）
+            if self._ocr_label:
+                try:
+                    res = self.state.get_latest_result()
+                    txt = (res.corrected or res.debounced_ocr or "").strip()
+                    display = (txt[:300] + "…") if len(txt) > 300 else (txt or "（无）")
+                    self._ocr_label.config(text="当前识别：" + (display or "（无）"))
+                except Exception:
+                    pass
             import time as time_mod
             history = self.state.get_chat_history()
             streaming = self.state.get_streaming_content()
@@ -319,7 +485,11 @@ class ChatWindow:
             self._chat_text.delete("1.0", tk.END)
             try:
                 import config
-                hint = getattr(config, "DIALOG_FEATURE_PROMPT", "")
+                hint = getattr(config, "DIALOG_FEATURE_PROMPT", "") or ""
+                if getattr(config, "FRENCH_TEACHING_MODE", False):
+                    extra = getattr(config, "DIALOG_FRENCH_TEACHING_PROMPT", "") or ""
+                    if extra:
+                        hint = (hint.strip() + "\n" + extra.strip()).strip()
             except Exception:
                 hint = "在下方输入框打字，点「发送」或回车发送；按住「语音」说话，松开结束。"
             if not hint:
@@ -335,9 +505,15 @@ class ChatWindow:
                 audio_path = (item[3] if len(item) > 3 else "") or ""
                 tstr = time_mod.strftime("%H:%M:%S", time_mod.localtime(ts)) if ts else ""
                 prefix = ("我 " + tstr + "  ") if role == "user" else ("助手 " + tstr + "  ")
-                lines = _wrap_text(text or "")
+                content = (text or "").strip()
+                if role == "assistant":
+                    content = _ensure_paragraph_breaks(content)
+                lines = _wrap_text(content)
                 for i, line in enumerate(lines):
-                    self._chat_text.insert(tk.END, (prefix if i == 0 else "    ") + line + "\n")
+                    if line == "":
+                        self._chat_text.insert(tk.END, "\n")
+                    else:
+                        self._chat_text.insert(tk.END, (prefix if i == 0 else "    ") + line + "\n")
                 if audio_path and role == "assistant" and os.path.isfile(audio_path):
                     play_idx += 1
                     path_for_btn = audio_path

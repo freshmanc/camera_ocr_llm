@@ -5,6 +5,7 @@ LLM 使用 Future.result(timeout) 与熔断，失败降级返回原文，主线�
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -162,82 +163,144 @@ def _pipeline_loop(
                     except Exception:
                         state.append_chat("assistant", "（朗读生成失败）")
                 else:
-                    history = state.get_chat_history()
-                    last_user_idx = None
-                    for i in range(len(history) - 1, -1, -1):
-                        if history[i][0] == "user":
-                            last_user_idx = i
-                            break
-                    raw = (
-                        history[:last_user_idx]
-                        if last_user_idx is not None
-                        else (history[:-1] if history else [])
-                    )
-                    recent = [(h[0], h[1]) for h in raw] if raw else []
-                    content = state.get_content_for_command()
-
-                    if getattr(config, "VOICE_ASSISTANT_DIRECT_LLM", False):
-                        # 直接对接 LLM：流式（VOICE_ASSISTANT_USE_STREAM=True）边收边显示；否则一次性请求
-                        state.start_streaming()
-                        use_stream = getattr(config, "VOICE_ASSISTANT_USE_STREAM", True)
-                        def _run_direct_llm():
+                    # 法语教学：记录学情（不调 LLM，直接写入学情文件）
+                    record_keywords = ("记录学情", "记下来", "记录")
+                    if getattr(config, "FRENCH_TEACHING_MODE", False) and any(k in msg for k in record_keywords):
+                        to_record = (state.get_last_read_content() or state.get_content_for_command() or "").strip()
+                        if to_record:
                             try:
-                                if use_stream:
-                                    from agents.voice_assistant_agent import chat_direct_llm_stream
-                                    reply = chat_direct_llm_stream(
-                                        pending_chat,
-                                        recent if recent else None,
-                                        content,
-                                        on_chunk=state.append_streaming_delta,
-                                    )
-                                else:
-                                    from agents.voice_assistant_agent import chat_direct_llm
-                                    reply = chat_direct_llm(pending_chat, recent if recent else None, content)
-                                state.finish_streaming(reply)
-                            except Exception as e:
-                                state.finish_streaming(f"(助手出错: {str(e)[:50]})")
-                        threading.Thread(target=_run_direct_llm, daemon=True).start()
+                                from agents.learning_context import append_learning_record
+                                ok = append_learning_record(to_record[:800])
+                                state.append_chat("assistant", "已记录到学情，老师会参考。" if ok else "（记录失败，请重试）")
+                            except Exception:
+                                state.append_chat("assistant", "（记录失败，请重试）")
+                        else:
+                            state.append_chat("assistant", "（当前或上一句暂无内容可记录，请先对准文字读一下或翻译后再说「记录学情」）")
                     else:
-                        # 原有逻辑：意图解析 + [ACTION:xxx]
-                        state.append_chat("assistant", "正在理解并执行…")
-                        def _run_chat_assistant():
+                        history = state.get_chat_history()
+                        last_user_idx = None
+                        for i in range(len(history) - 1, -1, -1):
+                            if history[i][0] == "user":
+                                last_user_idx = i
+                                break
+                        raw = (
+                            history[:last_user_idx]
+                            if last_user_idx is not None
+                            else (history[:-1] if history else [])
+                        )
+                        recent = [(h[0], h[1]) for h in raw] if raw else []
+                        content = state.get_content_for_command()
+                        uploaded_name, uploaded_content = state.get_uploaded_file()
+
+                        # 考试：出卷子 / 批改（使用上传内容或当前画面）
+                        if any(k in msg for k in ("出卷子", "生成试卷")):
+                            source = (uploaded_content or content or "").strip()
+                            fmt = getattr(config, "EXAM_DEFAULT_FORMAT", "txt") or "txt"
+                            num_q = getattr(config, "EXAM_NUM_QUESTIONS", 5)
                             try:
-                                from agents.voice_assistant_agent import chat_with_assistant
-                                reply, action = chat_with_assistant(pending_chat, recent if recent else None)
-                                if action == "read":
-                                    content_for_cmd = state.get_content_for_command()
-                                    content_for_lang = state.get_content_for_tts_lang_detect()
-                                    path = generate_tts_file(content_for_cmd or "", lang_detect_text=content_for_lang or None)
-                                    if path:
-                                        _txt = (content_for_cmd or "")[:600]
-                                        if len(content_for_cmd or "") > 600:
-                                            _txt += "…"
-                                        state.set_last_read_content(content_for_cmd or "")
-                                        state.append_chat("assistant", "正在朗读。\n【内容】\n" + _txt, audio_path=path)
-                                    else:
-                                        state.append_chat("assistant", reply or "（朗读生成失败）")
+                                from agents.exam_agent import generate_exam_paper
+                                paper_path, answer_key_path, err = generate_exam_paper(source, output_format=fmt, num_questions=num_q)
+                                if err and not paper_path:
+                                    state.append_chat("assistant", "（生成试卷失败）" + err)
                                 else:
-                                    state.append_chat("assistant", reply)
-                                    if action == "translate_previous":
-                                        content_prev = state.get_last_read_content()
-                                        if content_prev:
-                                            from agents.user_command_agents import translate_with_llm
-                                            result = translate_with_llm(content_prev)
-                                            state.append_chat("assistant", "【翻译】（上一句）\n" + (result or "（无结果）"))
-                                        else:
-                                            state.append_chat("assistant", "（没有之前的朗读内容可翻译，请先「读一下」或说「翻译」翻译当前画面）")
-                                    elif action and action in ("translate", "pronounce", "examples"):
-                                        content_for_cmd = state.get_content_for_command()
-                                        state.set_pending_user_command(action, content_for_cmd)
-                                    elif action == "send_ocr_result":
-                                        content_c = state.get_content_for_command()
-                                        if content_c:
-                                            state.append_chat("assistant", "当前识别到的文字：\n" + content_c)
-                                        else:
-                                            state.append_chat("assistant", "（当前画面暂无识别到文字，请对准文字后再试）")
+                                    state.set_last_exam_paths(paper_path, answer_key_path)
+                                    state.append_chat("assistant", f"试卷已生成。\n试卷：{paper_path}\n答案：{answer_key_path}\n" + (err or ""))
                             except Exception as e:
-                                state.append_chat("assistant", f"(助手出错: {str(e)[:50]})")
-                        threading.Thread(target=_run_chat_assistant, daemon=True).start()
+                                state.append_chat("assistant", "（生成试卷异常: " + str(e)[:80] + "）")
+                            state.get_and_clear_uploaded_file()
+                        elif any(k in msg for k in ("批改", "批改试卷")):
+                            student_answer = (uploaded_content or "").strip()
+                            if not student_answer:
+                                state.append_chat("assistant", "请先点击「上传」选择你的答案文件（TXT/PDF/Word），再说「批改试卷」。")
+                            else:
+                                paper_path, answer_key_path = state.get_last_exam_paths()
+                                if not answer_key_path or not os.path.isfile(answer_key_path):
+                                    state.append_chat("assistant", "未找到上次生成的试卷答案，请先生成试卷再批改。")
+                                else:
+                                    try:
+                                        paper_content = ""
+                                        if paper_path and os.path.isfile(paper_path):
+                                            with open(paper_path, "r", encoding="utf-8", errors="replace") as f:
+                                                paper_content = f.read()
+                                        from agents.exam_agent import grade_exam
+                                        summary, feedback = grade_exam(student_answer, answer_key_path, paper_content)
+                                        state.append_chat("assistant", f"【批改结果】\n{summary}\n\n【详解】\n{feedback}")
+                                    except Exception as e:
+                                        state.append_chat("assistant", "（批改异常: " + str(e)[:80] + "）")
+                            state.get_and_clear_uploaded_file()
+                        elif getattr(config, "VOICE_ASSISTANT_DIRECT_LLM", False):
+                            # 直接对接 LLM：流式边收边显示；可选附带上传文件（用后清空）
+                            _un, _uc = state.get_and_clear_uploaded_file()
+                            if _un is None and _uc is None:
+                                _un, _uc = uploaded_name, uploaded_content
+                            state.start_streaming()
+                            use_stream = getattr(config, "VOICE_ASSISTANT_USE_STREAM", True)
+                            def _run_direct_llm():
+                                try:
+                                    if use_stream:
+                                        from agents.voice_assistant_agent import chat_direct_llm_stream
+                                        reply = chat_direct_llm_stream(
+                                            pending_chat,
+                                            recent if recent else None,
+                                            content,
+                                            on_chunk=state.append_streaming_delta,
+                                            uploaded_file_name=_un,
+                                            uploaded_file_content=_uc,
+                                        )
+                                    else:
+                                        from agents.voice_assistant_agent import chat_direct_llm
+                                        reply = chat_direct_llm(
+                                            pending_chat,
+                                            recent if recent else None,
+                                            content,
+                                            uploaded_file_name=_un,
+                                            uploaded_file_content=_uc,
+                                        )
+                                    state.finish_streaming(reply)
+                                except Exception as e:
+                                    state.finish_streaming(f"(助手出错: {str(e)[:50]})")
+                            threading.Thread(target=_run_direct_llm, daemon=True).start()
+                        else:
+                            # 原有逻辑：意图解析 + [ACTION:xxx]
+                            state.append_chat("assistant", "正在理解并执行…")
+                            def _run_chat_assistant():
+                                try:
+                                    from agents.voice_assistant_agent import chat_with_assistant
+                                    reply, action = chat_with_assistant(pending_chat, recent if recent else None)
+                                    if action == "read":
+                                        content_for_cmd = state.get_content_for_command()
+                                        content_for_lang = state.get_content_for_tts_lang_detect()
+                                        path = generate_tts_file(content_for_cmd or "", lang_detect_text=content_for_lang or None)
+                                        if path:
+                                            _txt = (content_for_cmd or "")[:600]
+                                            if len(content_for_cmd or "") > 600:
+                                                _txt += "…"
+                                            state.set_last_read_content(content_for_cmd or "")
+                                            state.append_chat("assistant", "正在朗读。\n【内容】\n" + _txt, audio_path=path)
+                                        else:
+                                            state.append_chat("assistant", reply or "（朗读生成失败）")
+                                    else:
+                                        state.append_chat("assistant", reply)
+                                        if action == "translate_previous":
+                                            content_prev = state.get_last_read_content()
+                                            if content_prev:
+                                                from agents.user_command_agents import translate_with_llm
+                                                result = translate_with_llm(content_prev)
+                                                state.append_chat("assistant", "【翻译】（上一句）\n" + (result or "（无结果）"))
+                                            else:
+                                                state.append_chat("assistant", "（没有之前的朗读内容可翻译，请先「读一下」或说「翻译」翻译当前画面）")
+                                        elif action and action in ("translate", "pronounce", "examples"):
+                                            content_for_cmd = state.get_content_for_command()
+                                            state.set_pending_user_command(action, content_for_cmd)
+                                        elif action == "send_ocr_result":
+                                            content_c = state.get_content_for_command()
+                                            if content_c:
+                                                state.append_chat("assistant", "当前识别到的文字：\n" + content_c)
+                                            else:
+                                                state.append_chat("assistant", "（当前画面暂无识别到文字，请对准文字后再试）")
+                                except Exception as e:
+                                    state.append_chat("assistant", f"(助手出错: {str(e)[:50]})")
+                            threading.Thread(target=_run_chat_assistant, daemon=True).start()
 
         # 若有未完成的 LLM 请求，先看是否已完成（不阻塞）
         if pending_llm is not None:
@@ -292,6 +355,63 @@ def _pipeline_loop(
                         pass
                 pending_llm = None
 
+        # 截图识别：用户点击「截图识别」提交的一帧，做一次 OCR+LLM 不经过去抖
+        # OCR 在管道线程内执行，避免 Paddle 在子线程中释放 GIL 导致崩溃
+        shot = state.get_and_clear_pending_screenshot()
+        if shot is not None:
+            state.set_last_ocr_frame(shot)
+            try:
+                raw_text, conf, ocr_ms, ocr_ok, err_msg = _run_ocr_safe(shot)
+            except Exception as e:
+                raw_text, conf, ocr_ms = "", 0.0, 0.0
+                ocr_ok = False
+                err_msg = str(e)
+                log(f"截图 OCR 异常: {e}", level="ERROR")
+            if not ocr_ok or not (raw_text and raw_text.strip()):
+                state.set_latest_result(
+                    raw_ocr=raw_text or "(无)",
+                    corrected=raw_text or "(无)",
+                    confidence=0.0,
+                    ocr_time_ms=ocr_ms,
+                    llm_time_ms=0.0,
+                    ocr_ok=ocr_ok,
+                    llm_ok=True,
+                    error_msg=err_msg,
+                    debounced_ocr=raw_text or "",
+                )
+                time.sleep(0.05)
+                continue
+            stable_text = raw_text.strip()
+            display_raw = raw_text
+            # LLM 纠错（同步等待）
+            try:
+                future_llm = executor.submit(_run_llm_safe, stable_text)
+                corrected, llm_ms, llm_ok, llm_err = future_llm.result(timeout=config.LLM_TIMEOUT_SEC + 5)
+            except Exception as e:
+                corrected, llm_ms, llm_ok, llm_err = stable_text, 0.0, False, str(e)
+            if metrics is not None:
+                try:
+                    metrics.set_ocr_llm_ms(ocr_ms, llm_ms)
+                except Exception:
+                    pass
+            _run_vision_and_cross_validate(state, corrected)
+            state.set_latest_result(
+                raw_ocr=display_raw,
+                corrected=corrected,
+                confidence=conf,
+                ocr_time_ms=ocr_ms,
+                llm_time_ms=llm_ms,
+                ocr_ok=True,
+                llm_ok=llm_ok,
+                error_msg=llm_err,
+                debounced_ocr=stable_text,
+            )
+            if config.LOG_TO_FILE and stable_text:
+                log_result(stable_text, corrected, conf, ocr_ms, llm_ms)
+            log("截图识别完成")
+            time.sleep(0.05)
+            continue
+
         try:
             frame = state.get_frame_for_ocr(
                 config.FRAME_SKIP,
@@ -310,13 +430,10 @@ def _pipeline_loop(
         # 存当前帧供视觉 LLM 与 OCR 交叉验证用
         state.set_last_ocr_frame(frame)
 
-        # OCR 在池中执行，带超时
+        # OCR 在管道线程内执行（避免 Paddle 在 ThreadPool 中释放 GIL 导致 PyEval_RestoreThread 崩溃）
         try:
-            future_ocr = executor.submit(_run_ocr_safe, frame)
-            raw_text, conf, ocr_ms, ocr_ok, err_msg = future_ocr.result(
-                timeout=config.OCR_FUTURE_TIMEOUT_SEC
-            )
-        except (FuturesTimeoutError, Exception) as e:
+            raw_text, conf, ocr_ms, ocr_ok, err_msg = _run_ocr_safe(frame)
+        except Exception as e:
             raw_text, conf, ocr_ms = "", 0.0, 0.0
             ocr_ok = False
             err_msg = str(e)
