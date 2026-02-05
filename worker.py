@@ -8,8 +8,10 @@ from __future__ import annotations
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import Optional
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from typing import TYPE_CHECKING, Optional
+
+import numpy as np
 
 import config
 from agents.agent_e import LLMCache, LLMThrottler
@@ -19,6 +21,9 @@ from tools.logger_util import log_result
 from tools.ocr_engine import run_ocr
 from shared_state import SharedState
 from agents.tts_agent import speak as tts_speak, speak_immediate as tts_speak_immediate, generate_tts_file
+
+if TYPE_CHECKING:
+    from tools.metrics import Metrics
 
 
 class _CircuitBreaker:
@@ -51,8 +56,30 @@ class _CircuitBreaker:
             return (time.monotonic() - self._last_failure_time) < self._cooldown_sec
 
 
-def _run_ocr_safe(frame) -> "tuple[str, float, float, bool, str | None]":
-    """在线程池中运行 OCR，返回 (raw_text, confidence, time_ms, success, error_msg)。"""
+# 子进程 OCR 用：避免 Paddle 在主进程/工作线程中释放 GIL 导致 PyEval_RestoreThread 崩溃
+_ocr_process_executor: Optional[ProcessPoolExecutor] = None
+_OCR_SUBPROCESS_TIMEOUT = 45
+
+
+def _run_ocr_in_process(frame: np.ndarray) -> "tuple[str, float, float, bool, str | None]":
+    """在子进程中运行 OCR（供 ProcessPoolExecutor 调用，可 pickle）。"""
+    from tools.ocr_engine import run_ocr
+    r = run_ocr(frame)
+    return (r.text, r.confidence, r.time_ms, r.success, r.error_msg)
+
+
+def _run_ocr_safe(frame: np.ndarray) -> "tuple[str, float, float, bool, str | None]":
+    """运行 OCR，返回 (raw_text, confidence, time_ms, success, error_msg)。子进程模式避免 GIL 崩溃。"""
+    use_sub = getattr(config, "OCR_USE_SUBPROCESS", True)
+    if use_sub and _ocr_process_executor is not None:
+        try:
+            frame_copy = np.asarray(frame, dtype=np.uint8).copy()
+            future = _ocr_process_executor.submit(_run_ocr_in_process, frame_copy)
+            return future.result(timeout=_OCR_SUBPROCESS_TIMEOUT)
+        except FuturesTimeoutError:
+            return ("", 0.0, 0.0, False, "OCR 子进程超时")
+        except Exception as e:
+            return ("", 0.0, 0.0, False, str(e))
     r = run_ocr(frame)
     return (r.text, r.confidence, r.time_ms, r.success, r.error_msg)
 
@@ -632,12 +659,20 @@ def start_worker(state: SharedState, metrics: Optional["Metrics"] = None) -> thr
         min_interval_ms=getattr(config, "LLM_MIN_INTERVAL_MS", 1000),
     )
     # 启动前用空白图触发一次 OCR 初始化，环境异常时在启动阶段报一次而非每帧刷屏
-    try:
-        import numpy as np
-        _dummy = np.zeros((64, 256, 3), dtype=np.uint8)
-        _ = run_ocr(_dummy)
-    except Exception:
-        pass
+    global _ocr_process_executor
+    if getattr(config, "OCR_USE_SUBPROCESS", True):
+        try:
+            _ocr_process_executor = ProcessPoolExecutor(max_workers=1)
+            _dummy = np.zeros((64, 256, 3), dtype=np.uint8)
+            _ = _ocr_process_executor.submit(_run_ocr_in_process, _dummy).result(timeout=_OCR_SUBPROCESS_TIMEOUT)
+        except Exception:
+            _ocr_process_executor = None
+    if _ocr_process_executor is None:
+        try:
+            _dummy = np.zeros((64, 256, 3), dtype=np.uint8)
+            _ = run_ocr(_dummy)
+        except Exception:
+            pass
     daemon = threading.Thread(
         target=_pipeline_loop,
         args=(state, executor, circuit_breaker, debouncer, metrics, cache, throttler),
@@ -646,3 +681,14 @@ def start_worker(state: SharedState, metrics: Optional["Metrics"] = None) -> thr
     )
     daemon.start()
     return daemon
+
+
+def shutdown_ocr_process_pool() -> None:
+    """退出时关闭 OCR 子进程池，避免解释器退出时触发 GIL/进程池崩溃。"""
+    global _ocr_process_executor
+    if _ocr_process_executor is not None:
+        try:
+            _ocr_process_executor.shutdown(wait=False)
+        except Exception:
+            pass
+        _ocr_process_executor = None

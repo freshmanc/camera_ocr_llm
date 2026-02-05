@@ -211,9 +211,9 @@ class ChatWindow:
                 pass
 
     def _on_window_close(self) -> None:
-        """用户点击关闭按钮：通知主程序退出并销毁本窗口。"""
+        """用户点击关闭：仅关闭本窗口，不退出程序；由「系统管理」窗口关闭时再退出。"""
         try:
-            self.state.set_quit_requested(True)
+            self.state.set_voice_window_closed(True)
         except Exception:
             pass
         try:
@@ -221,6 +221,10 @@ class ChatWindow:
                 self._root.destroy()
         except Exception:
             pass
+
+    def close(self) -> None:
+        """程序化关闭窗口（与用户点 X 一致）：仅关本窗口，做好状态与销毁，不影响 Web/手机端。"""
+        self._on_window_close()
 
     def _on_toggle_camera(self) -> None:
         """切换摄像头与识别的启停：按需打开/关闭设备。"""

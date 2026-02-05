@@ -67,11 +67,15 @@ class SharedState:
         self._last_exam_answer_key_path: Optional[str] = None
         # 截图识别：提交一帧做一次 OCR+LLM，后台取走后清空
         self._pending_screenshot: Optional[np.ndarray] = None
-        # 语音助手窗口关闭时设为 True，主循环据此退出
+        # 系统管理窗口关闭时设为 True，主循环据此退出整个程序
         self._quit_requested: bool = False
+        # 语音助手窗口关闭时设为 True（仅关该窗口，不退出程序）；主循环清空后置 _chat_window=None
+        self._voice_window_closed: bool = False
+        # Web 服务子进程（由管理窗口启动/停止），主程序退出时需终止
+        self._web_server_process: Optional[object] = None
 
     def set_quit_requested(self, value: bool = True) -> None:
-        """语音助手窗口关闭时调用，主循环检测后退出。"""
+        """系统管理窗口关闭时调用，主循环检测后退出整个程序。"""
         with self._lock:
             self._quit_requested = value
 
@@ -79,6 +83,26 @@ class SharedState:
         """主循环每轮检查，为 True 时退出。"""
         with self._lock:
             return self._quit_requested
+
+    def set_voice_window_closed(self, value: bool = True) -> None:
+        """语音助手窗口关闭时调用，主循环将 _chat_window 置 None，不退出程序。"""
+        with self._lock:
+            self._voice_window_closed = value
+
+    def get_and_clear_voice_window_closed(self) -> bool:
+        """主循环：是否刚关闭了语音助手窗口，取后清空。"""
+        with self._lock:
+            v = self._voice_window_closed
+            self._voice_window_closed = False
+            return v
+
+    def set_web_server_process(self, process: Optional[object]) -> None:
+        with self._lock:
+            self._web_server_process = process
+
+    def get_web_server_process(self) -> Optional[object]:
+        with self._lock:
+            return self._web_server_process
 
     def append_chat(self, role: str, text: str, audio_path: Optional[str] = None) -> None:
         """后台线程：追加一条对话（user 或 assistant），带时间戳；可选附带朗读音频路径（会触发自动播放）。"""

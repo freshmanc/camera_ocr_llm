@@ -26,6 +26,8 @@ OCR_MOTION_STABLE_THRESHOLD = 18.0  # 与上一帧平均像素差低于此认为
 # OCR：使用 PaddleOCR。推荐环境（Windows 最稳）：Python 3.10 + paddlepaddle==2.6.2 + paddleocr==2.7.0.3（经典版，不走 paddlex/PDX）
 USE_EASYOCR = False   # False=先用 PaddleOCR，失败再用 EasyOCR；True=反之
 USE_PADDLE_OCR = True
+# 在子进程中跑 OCR，避免 Paddle 释放 GIL 导致 PyEval_RestoreThread 崩溃（建议 True）
+OCR_USE_SUBPROCESS = True
 OCR_LANGS = ["en", "fr"]  # EasyOCR 用；Paddle 用 PADDLE_OCR_LANG
 OCR_GPU = True  # RTX4060 建议 True；Paddle 用 PADDLE_OCR_FORCE_CPU 控制是否强制 CPU
 # PaddleOCR 语言：ch=中英, en=英文, fr=法语等

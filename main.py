@@ -26,12 +26,14 @@ import numpy as np
 import config
 from tools.overlay import build_display_lines, build_display_lines_compact, draw_text_block, wrap_text_for_display
 from shared_state import SharedState
-from worker import start_worker
+from worker import start_worker, shutdown_ocr_process_pool
 from tools.logger_util import log, log_metrics, save_debug_frame
 from tools.metrics import Metrics
 from tools.ocr_engine import init_paddle_ocr_engine
 
-# 白底黑字可交互对话窗口（打字 + 小麦克风）
+# 系统管理窗口：关闭即退出整个程序，并管理 Web 服务
+_manager_window = None
+# 语音助手窗口：关闭仅关本窗口，不退出程序；可从管理窗口再次打开
 _chat_window = None
 # 摄像头隐藏时的占位图（仅用于 show_camera_window 隐藏时的占位）
 _placeholder_frame = None
@@ -95,7 +97,54 @@ def main() -> int:
         sys.modules["tools"] = _tools_mod
         _spec.loader.exec_module(_tools_mod)
         from tools.chat_window import ChatWindow
-        global _chat_window
+        from tools.manager_window import ManagerWindow
+        global _manager_window, _chat_window
+
+        def _open_voice_assistant():
+            global _chat_window
+            try:
+                if _chat_window is not None and _chat_window._root and _chat_window._root.winfo_exists():
+                    _chat_window._root.lift()
+                    return
+            except Exception:
+                pass
+            try:
+                _chat_window = ChatWindow(state, title="语音助手")
+                _chat_window.build()
+                if _chat_window._root:
+                    _chat_window._root.lift()
+                log("语音助手已打开")
+            except Exception as e:
+                log(f"打开语音助手失败: {e}", level="ERROR")
+
+        def _close_voice_assistant():
+            global _chat_window
+            if _chat_window is None:
+                return
+            try:
+                _chat_window.close()
+            except Exception:
+                pass
+            _chat_window = None
+
+        def _is_voice_open():
+            global _chat_window
+            if _chat_window is None:
+                return False
+            try:
+                return _chat_window._root is not None and _chat_window._root.winfo_exists()
+            except Exception:
+                return False
+
+        _manager_window = ManagerWindow(
+            state,
+            on_open_voice_assistant=_open_voice_assistant,
+            on_close_voice_assistant=_close_voice_assistant,
+            is_voice_open=_is_voice_open,
+            title="系统管理",
+        )
+        _manager_window.build()
+        log("系统管理窗口已开启：关闭本窗口将退出整个程序；可在此启停 Web/手机 服务。")
         _chat_window = ChatWindow(state, title="语音助手")
         _chat_window.build()
         log("语音助手已开启：白底黑字对话窗口，可打字、点「麦」语音，支持朗读/翻译/读音/例句")
@@ -106,6 +155,16 @@ def main() -> int:
         while True:
             if state.get_quit_requested():
                 break
+            if state.get_and_clear_voice_window_closed():
+                _chat_window = None
+                log("语音助手已关闭")
+            if _manager_window is not None:
+                try:
+                    _manager_window.update_ui()
+                    if _manager_window._root and _manager_window._root.winfo_exists():
+                        _manager_window._root.update()
+                except Exception:
+                    pass
             camera_wanted = state.get_camera_wanted()
             key = cv2.waitKey(1) & 0xFF
 
@@ -268,6 +327,27 @@ def main() -> int:
     except KeyboardInterrupt:
         log("用户中断")
     finally:
+        try:
+            shutdown_ocr_process_pool()
+        except Exception:
+            pass
+        proc = state.get_web_server_process()
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            state.set_web_server_process(None)
+        if _manager_window is not None:
+            try:
+                if _manager_window._root and _manager_window._root.winfo_exists():
+                    _manager_window._root.destroy()
+            except Exception:
+                pass
         if _chat_window is not None:
             try:
                 _chat_window.destroy()
@@ -284,4 +364,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # 强制退出进程，避免 ProcessPoolExecutor/Tk 等非 daemon 线程阻塞导致终端无法回到命令行
+    os._exit(code)
