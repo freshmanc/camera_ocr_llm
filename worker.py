@@ -145,14 +145,18 @@ def _pipeline_loop(
                 msg = (pending_chat or "").strip()
                 content, confidence = state.get_content_and_confidence_for_command()
                 keywords = getattr(config, "VOICE_READ_COMMAND_KEYWORDS", ("读一下", "读出来", "朗读", "读一下视频"))
-                conf_thresh = getattr(config, "VOICE_READ_DIRECT_CONFIDENCE", 0.90)
+                conf_thresh = getattr(config, "VOICE_READ_DIRECT_CONFIDENCE", 0.0)
                 is_read_cmd = any(k in msg for k in keywords)
-                # 当是「读一下」且当前画面文字置信度>=90% 时，不走 LLM，直接生成朗读音频并写入对话（对话框内点击播放）
-                if is_read_cmd and confidence >= conf_thresh and content:
+                # 「读一下」且有画面文字时优先直接朗读，不走 LLM，保证顺序正确且立刻有音频
+                if is_read_cmd and content and (confidence >= conf_thresh if conf_thresh > 0 else True):
                     try:
-                        path = generate_tts_file(content)
+                        # 语言检测优先用 debounced_ocr（可能保留重音），避免纠错后丢重音被读成英语
+                        content_for_lang = state.get_content_for_tts_lang_detect()
+                        path = generate_tts_file(content, lang_detect_text=content_for_lang or None)
                         if path:
-                            state.append_chat("assistant", "正在朗读。", audio_path=path)
+                            _content_preview = (content[:600] + "…") if len(content) > 600 else content
+                            state.set_last_read_content(content)
+                            state.append_chat("assistant", "正在朗读。\n【内容】\n" + _content_preview, audio_path=path)
                         else:
                             state.append_chat("assistant", "（朗读生成失败或暂无文字）")
                     except Exception:
@@ -170,35 +174,70 @@ def _pipeline_loop(
                         else (history[:-1] if history else [])
                     )
                     recent = [(h[0], h[1]) for h in raw] if raw else []
-                    state.append_chat("assistant", "正在理解并执行…")
+                    content = state.get_content_for_command()
 
-                    def _run_chat_assistant():
-                        try:
-                            from agents.voice_assistant_agent import chat_with_assistant
-                            reply, action = chat_with_assistant(pending_chat, recent if recent else None)
-                            if action == "read":
-                                # 朗读：只追加一条带「🔊 播放」的消息，不追加 LLM 回复、不调用系统播放器
-                                content_for_cmd = state.get_content_for_command()
-                                path = generate_tts_file(content_for_cmd or "")
-                                if path:
-                                    state.append_chat("assistant", "正在朗读。", audio_path=path)
+                    if getattr(config, "VOICE_ASSISTANT_DIRECT_LLM", False):
+                        # 直接对接 LLM：流式（VOICE_ASSISTANT_USE_STREAM=True）边收边显示；否则一次性请求
+                        state.start_streaming()
+                        use_stream = getattr(config, "VOICE_ASSISTANT_USE_STREAM", True)
+                        def _run_direct_llm():
+                            try:
+                                if use_stream:
+                                    from agents.voice_assistant_agent import chat_direct_llm_stream
+                                    reply = chat_direct_llm_stream(
+                                        pending_chat,
+                                        recent if recent else None,
+                                        content,
+                                        on_chunk=state.append_streaming_delta,
+                                    )
                                 else:
-                                    state.append_chat("assistant", reply or "（朗读生成失败）")
-                            else:
-                                state.append_chat("assistant", reply)
-                                if action and action in ("translate", "pronounce", "examples"):
+                                    from agents.voice_assistant_agent import chat_direct_llm
+                                    reply = chat_direct_llm(pending_chat, recent if recent else None, content)
+                                state.finish_streaming(reply)
+                            except Exception as e:
+                                state.finish_streaming(f"(助手出错: {str(e)[:50]})")
+                        threading.Thread(target=_run_direct_llm, daemon=True).start()
+                    else:
+                        # 原有逻辑：意图解析 + [ACTION:xxx]
+                        state.append_chat("assistant", "正在理解并执行…")
+                        def _run_chat_assistant():
+                            try:
+                                from agents.voice_assistant_agent import chat_with_assistant
+                                reply, action = chat_with_assistant(pending_chat, recent if recent else None)
+                                if action == "read":
                                     content_for_cmd = state.get_content_for_command()
-                                    state.set_pending_user_command(action, content_for_cmd)
-                                elif action == "send_ocr_result":
-                                    content = state.get_content_for_command()
-                                    if content:
-                                        state.append_chat("assistant", "当前识别到的文字：\n" + content)
+                                    content_for_lang = state.get_content_for_tts_lang_detect()
+                                    path = generate_tts_file(content_for_cmd or "", lang_detect_text=content_for_lang or None)
+                                    if path:
+                                        _txt = (content_for_cmd or "")[:600]
+                                        if len(content_for_cmd or "") > 600:
+                                            _txt += "…"
+                                        state.set_last_read_content(content_for_cmd or "")
+                                        state.append_chat("assistant", "正在朗读。\n【内容】\n" + _txt, audio_path=path)
                                     else:
-                                        state.append_chat("assistant", "（当前画面暂无识别到文字，请对准文字后再试）")
-                        except Exception as e:
-                            state.append_chat("assistant", f"(助手出错: {str(e)[:50]})")
-
-                    threading.Thread(target=_run_chat_assistant, daemon=True).start()
+                                        state.append_chat("assistant", reply or "（朗读生成失败）")
+                                else:
+                                    state.append_chat("assistant", reply)
+                                    if action == "translate_previous":
+                                        content_prev = state.get_last_read_content()
+                                        if content_prev:
+                                            from agents.user_command_agents import translate_with_llm
+                                            result = translate_with_llm(content_prev)
+                                            state.append_chat("assistant", "【翻译】（上一句）\n" + (result or "（无结果）"))
+                                        else:
+                                            state.append_chat("assistant", "（没有之前的朗读内容可翻译，请先「读一下」或说「翻译」翻译当前画面）")
+                                    elif action and action in ("translate", "pronounce", "examples"):
+                                        content_for_cmd = state.get_content_for_command()
+                                        state.set_pending_user_command(action, content_for_cmd)
+                                    elif action == "send_ocr_result":
+                                        content_c = state.get_content_for_command()
+                                        if content_c:
+                                            state.append_chat("assistant", "当前识别到的文字：\n" + content_c)
+                                        else:
+                                            state.append_chat("assistant", "（当前画面暂无识别到文字，请对准文字后再试）")
+                            except Exception as e:
+                                state.append_chat("assistant", f"(助手出错: {str(e)[:50]})")
+                        threading.Thread(target=_run_chat_assistant, daemon=True).start()
 
         # 若有未完成的 LLM 请求，先看是否已完成（不阻塞）
         if pending_llm is not None:

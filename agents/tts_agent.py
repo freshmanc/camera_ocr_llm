@@ -10,6 +10,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import unicodedata
 from collections import deque
 from typing import Optional
 
@@ -31,14 +32,28 @@ except ImportError:
     _HAS_LANGDETECT = False
 
 
+def _normalize_for_lang(text: str) -> str:
+    """统一为 NFC，便于识别「e + 组合重音」等为 é。"""
+    return unicodedata.normalize("NFC", (text or "").strip())
+
+
 def detect_language(text: str) -> str:
     """
     识别文本主要语言，返回 'en' 或 'fr'。
-    无法识别或非英法时返回 config.TTS_DEFAULT_LANG 或 'en'。
+    支持 config.TTS_FORCE_LANG 强制指定；有法语特征或常见法语词时优先判为法语。
     """
-    t = (text or "").strip()
+    t = _normalize_for_lang(text or "")
     if not t or len(t) < 2:
         return getattr(config, "TTS_DEFAULT_LANG", "en")
+    force = (getattr(config, "TTS_FORCE_LANG", "") or "").strip().lower()
+    if force in ("fr", "en"):
+        return force
+    # 先看是否有明显法语特征（重音、ç、œ、æ）
+    if _has_french_markers(t):
+        return "fr"
+    # OCR 常丢失重音：看是否含常见法语词（无重音写法）
+    if _looks_like_french_by_words(t):
+        return "fr"
     if not _HAS_LANGDETECT:
         return _fallback_detect_language(t) or getattr(config, "TTS_DEFAULT_LANG", "en")
     try:
@@ -50,11 +65,41 @@ def detect_language(text: str) -> str:
         return _fallback_detect_language(t) or getattr(config, "TTS_DEFAULT_LANG", "en")
 
 
+def _looks_like_french_by_words(text: str) -> bool:
+    """无重音时根据常见法语词判断（OCR 常把 déterminants 识别成 determinants）。"""
+    t = (text or "").lower()
+    words = set(w.strip(".,;:?!\"'()") for w in t.split() if len(w.strip(".,;:?!\"'()")) >= 2)
+    # 常见法语词（无重音形式），出现 2 个以上则倾向法语
+    french_hints = {
+        "les", "des", "une", "est", "sont", "dans", "pour", "avec", "aux", "que", "qui",
+        "pas", "sur", "tout", "sous", "mais", "ces", "mes", "ses", "nos", "vos", "leur",
+        "ont", "fait", "plus", "bien", "très", "aussi", "comme", "être", "avoir", "se", "le", "la",
+        "ferment", "fermer", "determinants", "déterminants", "souverain", "souveraine",
+    }
+    count = sum(1 for w in words if w in french_hints)
+    if count >= 2:
+        return True
+    # 单词但很典型（如整句 "les determinants se ferment" 里 les + des 等）
+    if count >= 1 and len(words) >= 2:
+        return True
+    return False
+
+
+def _has_french_markers(text: str) -> bool:
+    """文本中是否含有明显法语特征（重音、ç、œ、æ 等），有则优先当法语。先 NFC 规范化以便识别组合字符。"""
+    t = _normalize_for_lang(text or "")
+    french_chars = "éèêëàâçîïôùûüœæ"
+    count = sum(1 for c in t if c.lower() in french_chars)
+    if count >= 1:
+        return True
+    if "ç" in t or "œ" in t.lower() or "æ" in t.lower():
+        return True
+    return False
+
+
 def _fallback_detect_language(text: str) -> Optional[str]:
     """无 langdetect 时：简单根据法文特征字符判断。"""
-    french_chars = "éèêëàâçîïôùûüœæ"
-    count = sum(1 for c in text if c.lower() in french_chars)
-    if count >= 2 or "ç" in text or "œ" in text.lower() or "æ" in text.lower():
+    if _has_french_markers(text):
         return "fr"
     return "en"
 
@@ -156,10 +201,11 @@ def _tts_dir() -> str:
     return d
 
 
-def generate_tts_file(text: str) -> Optional[str]:
+def generate_tts_file(text: str, lang_detect_text: Optional[str] = None) -> Optional[str]:
     """
     仅生成朗读音频文件并返回路径，不调用系统播放器。用于对话框内嵌「🔊 播放」。
     文本过长会截断；失败返回 None。文件保存在 logs/tts，保留最近若干份。
+    lang_detect_text：若提供则仅用于语言检测（可传带重音的原文），朗读内容仍用 text。
     """
     t = (text or "").strip()
     if not t or len(t) > 2000:
@@ -168,7 +214,7 @@ def generate_tts_file(text: str) -> Optional[str]:
         import edge_tts
     except ImportError:
         return None
-    lang = detect_language(t)
+    lang = detect_language((lang_detect_text or t).strip())
     voice = get_voice_for_language(lang)
     rate = getattr(config, "TTS_RATE", "+0%")
     communicate = edge_tts.Communicate(t, voice, rate=rate)

@@ -48,10 +48,13 @@ class SharedState:
         self._last_ocr_frame: Optional[np.ndarray] = None
         self._vision_llm_text: str = ""
         self._cross_validated_text: str = ""
-        # 语音助手：对话历史 (role, text, timestamp, audio_path?) + 待发送的用户消息 + 待自动播放音频
+        # 语音助手：对话历史 (role, text, timestamp, audio_path?) + 待发送的用户消息 + 待自动播放音频 + 上一次朗读的【内容】（用于「翻译之前的」）
         self._chat_history: List[Tuple] = []
         self._pending_chat_message: Optional[str] = None
         self._pending_play_audio: Optional[str] = None
+        self._last_read_content: str = ""
+        # 流式回复：当前正在接收的助手内容，get_chat_history 会把它合并到最后一条 assistant 显示
+        self._streaming_text: Optional[str] = None
 
     def append_chat(self, role: str, text: str, audio_path: Optional[str] = None) -> None:
         """后台线程：追加一条对话（user 或 assistant），带时间戳；可选附带朗读音频路径（会触发自动播放）。"""
@@ -60,7 +63,11 @@ class SharedState:
             self._chat_history.append((role, (text or "").strip(), time.time(), path))
             if path:
                 self._pending_play_audio = path
-            max_len = 64
+            try:
+                import config
+                max_len = getattr(config, "CHAT_HISTORY_MAX", 64)
+            except Exception:
+                max_len = 64
             if len(self._chat_history) > max_len:
                 self._chat_history = self._chat_history[-max_len:]
 
@@ -72,9 +79,60 @@ class SharedState:
             return path
 
     def get_chat_history(self) -> List[Tuple]:
-        """主线程：获取对话历史副本 [(role, text, timestamp, audio_path), ...]，用于绘制。"""
+        """主线程：获取对话历史副本 [(role, text, timestamp, audio_path), ...]，用于绘制。流式时最后一条 assistant 的 text 为当前 _streaming_text。"""
         with self._lock:
-            return list(self._chat_history)
+            out = list(self._chat_history)
+            if self._streaming_text is not None and out and out[-1][0] == "assistant":
+                last = out[-1]
+                out[-1] = (last[0], self._streaming_text, last[2], last[3] if len(last) > 3 else None)
+            return out
+
+    def start_streaming(self, placeholder: str = "已收到，正在处理…") -> None:
+        """后台：开始流式回复，最后一条 assistant 显示 placeholder，后续通过 append_streaming_delta 追加；结束时由 finish_streaming 写最终内容。
+        若此前有未结束的流（用户中途点麦/发新消息），先把已生成内容写回对应 assistant，避免被新流覆盖丢失。"""
+        with self._lock:
+            # 此前有流未 finish_streaming 时，先固化到“当时在写”的那条 assistant（最后一条内容为空的）
+            if self._streaming_text is not None and self._chat_history:
+                prev = (self._streaming_text or "").strip()
+                for i in range(len(self._chat_history) - 1, -1, -1):
+                    if self._chat_history[i][0] == "assistant" and ((self._chat_history[i][1] or "").strip() == ""):
+                        last = self._chat_history[i]
+                        self._chat_history[i] = (last[0], prev or "（回复被中断）", last[2], last[3] if len(last) > 3 else None)
+                        break
+                self._streaming_text = None
+            if self._chat_history and self._chat_history[-1][0] == "assistant":
+                last = self._chat_history[-1]
+                self._chat_history[-1] = (last[0], "", last[2], last[3] if len(last) > 3 else None)
+            self._streaming_text = (placeholder or "").strip()
+
+    def append_streaming_delta(self, delta: str) -> None:
+        """后台：追加一段流式内容（LLM 每收到一块就调用）。"""
+        with self._lock:
+            if self._streaming_text is not None:
+                self._streaming_text = (self._streaming_text or "") + (delta or "")
+
+    def get_streaming_content(self) -> Optional[str]:
+        """主线程：当前流式内容，用于判断是否需要刷新对话区。"""
+        with self._lock:
+            return self._streaming_text
+
+    def finish_streaming(self, final_text: str) -> None:
+        """后台：结束流式，将最后一条 assistant 设为最终内容并清空 _streaming_text。"""
+        with self._lock:
+            text = (final_text or "").strip()
+            if self._chat_history and self._chat_history[-1][0] == "assistant":
+                last = self._chat_history[-1]
+                self._chat_history[-1] = (last[0], text, last[2], last[3] if len(last) > 3 else None)
+            else:
+                self._chat_history.append(("assistant", text, time.time(), None))
+            self._streaming_text = None
+            try:
+                import config
+                max_len = getattr(config, "CHAT_HISTORY_MAX", 64)
+            except Exception:
+                max_len = 64
+            if len(self._chat_history) > max_len:
+                self._chat_history = self._chat_history[-max_len:]
 
     def set_pending_chat(self, message: str) -> None:
         """主线程：用户输入/语音识别后，提交给助手。"""
@@ -92,6 +150,22 @@ class SharedState:
         """后台线程：获取当前可用于朗读/翻译等的文本（纠错后或去抖 OCR）。"""
         with self._lock:
             return (self.latest_result.corrected or self.latest_result.debounced_ocr or "").strip()
+
+    def get_content_for_tts_lang_detect(self) -> str:
+        """后台线程：获取用于 TTS 语言检测的文本。优先用 debounced_ocr（可能保留重音），避免纠错后丢重音被误判成英语。"""
+        with self._lock:
+            # 优先用去抖 OCR，因 LLM 纠错有时会去掉 é 等重音
+            return (self.latest_result.debounced_ocr or self.latest_result.corrected or "").strip()
+
+    def set_last_read_content(self, content: str) -> None:
+        """后台线程：保存最近一次朗读的【内容】，供「翻译之前的句子」等使用。"""
+        with self._lock:
+            self._last_read_content = (content or "").strip()
+
+    def get_last_read_content(self) -> str:
+        """后台线程：取回最近一次朗读的【内容】。"""
+        with self._lock:
+            return (self._last_read_content or "").strip()
 
     def get_content_and_confidence_for_command(self) -> Tuple[str, float]:
         """后台线程：获取当前可朗读的文本及其置信度（0~1），用于「读一下」短路判断。"""

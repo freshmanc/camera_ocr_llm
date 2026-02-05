@@ -306,7 +306,10 @@ class ChatWindow:
         try:
             import time as time_mod
             history = self.state.get_chat_history()
+            streaming = self.state.get_streaming_content()
             sig = str(len(history)) + (str(history[-1]) if history else "")
+            if streaming is not None:
+                sig += "_stream_%d" % len(streaming)  # 流式时随内容增长触发重绘，及时显示 LLM 输出
             if sig == self._last_history_sig:
                 return
             self._last_history_sig = sig

@@ -65,8 +65,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # 或直接写 "sk-..."�
 # 本地 LM Studio（LLM_USE_OPENAI=False 时生效）
 LLM_BASE_URL = "http://127.0.0.1:1234/v1"
 # 模型：用 OpenAI 时填 "gpt-4o" / "gpt-4o-mini" 等；用 LM Studio 时填 LM Studio 里的 id 如 "qwen/qwen3-8b"
-LLM_MODEL = "qwen3-VL-8b-thinking"  # 本地视觉语言模型，LM Studio 中显示的 id 为准
-# thinking 模型（如 qwen3-vl-8b-thinking）推理慢，过短会触发 Client disconnected
+LLM_MODEL = "qwen3-vl-8b"  # 本地视觉语言模型，LM Studio 中显示的 id 为准（非 thinking 版更快）
 LLM_TIMEOUT_SEC = 60
 LLM_MAX_TOKENS = 280  # 只给 JSON 用，避免模型长篇推理浪费算力
 LLM_TEMPERATURE = 0.2  # 严格纠错宜低，减少随意改写
@@ -94,11 +93,19 @@ USER_CMD_MAX_TOKENS = 350
 # 翻译目标语言：zh=中文 en=英文
 USER_CMD_TRANSLATE_TARGET = "zh"
 
-# 语音助手 Agent：对话式助手，识别意图（朗读/翻译/读音/例句等），对话在「语音助手」窗口显示
+# 语音助手 Agent：对话式助手，对话在「语音助手」窗口显示
 ENABLE_VOICE_ASSISTANT = True
+# True=对话窗口只做中转：用户消息+历史直接发给 LLM，回复原样显示（除「读一下」走 TTS 短路）；False=沿用 [ACTION:xxx] 意图解析
+VOICE_ASSISTANT_DIRECT_LLM = True
+# 语音助手专用模型/地址：thinking 模型慢 1～2 分钟，可改为更快模型或另开 LM Studio
+# 空则用上面的 LLM_MODEL / LLM_BASE_URL；若 LM Studio 另开一个实例跑快模型（如 qwen3-8b），填下面
+VOICE_ASSISTANT_BASE_URL = ""   # 例：http://127.0.0.1:1235/v1（第二台 LM Studio）
+VOICE_ASSISTANT_MODEL = ""      # 例：qwen3-8b（非 thinking），空则用 LLM_MODEL
 CHAT_WINDOW_WIDTH = 520
 CHAT_WINDOW_HEIGHT = 420
-CHAT_HISTORY_MAX = 32          # 保留最近 N 条对话（用户+助手各算一条）
+CHAT_HISTORY_MAX = 64          # 保留最近 N 条对话（短期记忆，用户+助手各算一条）
+VOICE_ASSISTANT_CONTEXT_MESSAGES = 24   # 传给 LLM 的最近对话条数，便于理解上下文
+VOICE_ASSISTANT_MEMORY = ""    # 长期记忆：写在这里的内容会追加到系统提示，LLM 始终可见（如「用户常读法语」）
 KEY_CHAT_INPUT = ord("i")      # I = 弹出文字输入框，与助手对话
 KEY_VOICE_INPUT = ord("v")     # V = 语音输入（需安装 SpeechRecognition + pyaudio）
 # 语音识别引擎：google=谷歌网页 API（需联网）；whisper=本地 Whisper（更准、可离线，需 pip install openai-whisper）
@@ -106,13 +113,15 @@ KEY_VOICE_INPUT = ord("v")     # V = 语音输入（需安装 SpeechRecognition 
 VOICE_RECOGNITION_ENGINE = "whisper"
 # 录音后是否先降噪再识别（需 pip install noisereduce，可选）
 VOICE_REDUCE_NOISE = True
-# 「读一下」短路：当用户说读一下且当前画面文字置信度 >= 此值时，不走 LLM，直接朗读
-VOICE_READ_DIRECT_CONFIDENCE = 0.90   # 0.9 = 90%
+# 「读一下」：只要有画面文字就优先直接朗读，不走 LLM，避免顺序错乱和延迟；仅当无文字时才走 LLM
+VOICE_READ_DIRECT_CONFIDENCE = 0.0    # 有内容即直接读，0 表示不要求置信度
 VOICE_READ_COMMAND_KEYWORDS = ("读一下", "读出来", "朗读", "读一下视频")
-# 语音助手 LLM 超时：thinking 模型（如 qwen3-vl-8b-thinking）需更长时间，否则会 Client disconnected
+# 语音助手 LLM 超时（非 thinking 模型一般十几秒内可回复）
 VOICE_ASSISTANT_TIMEOUT_SEC = 90
-# thinking 模型先输出推理再给结论，需留足空间避免在 [ACTION:xxx] 前被截断（length）；翻译等内容由后续单独请求返回，不占此限额
-VOICE_ASSISTANT_MAX_TOKENS = 700
+# 是否使用流式请求（stream=True）：LM Studio 0.3.x 支持，可边收边显示、减少断连；若仍断连或模型不支持可改为 False
+VOICE_ASSISTANT_USE_STREAM = True
+# thinking 模型先输出推理再给结论，需留足空间避免在 [ACTION:xxx] 前被截断（length）；日志见 completion_tokens 达 686+ 仍截断则再调大
+VOICE_ASSISTANT_MAX_TOKENS = 950
 # 界面只展示「结论」的最大字数，超过则从回复末尾提取短句（过滤 thinking 冗长推理）
 VOICE_ASSISTANT_DISPLAY_MAX_CHARS = 80
 # 助手系统提示：极简回复避免超时断连，禁止长篇推理；thinking 模型也请把结论放在最后一行
@@ -120,24 +129,25 @@ VOICE_ASSISTANT_SYSTEM = """你是摄像头 OCR 应用的语音助手。用户�
 
 硬性规则：你的回复必须极短，总长度不超过 80 字。禁止输出推理、分析、首先、Let's、We are given、Okay 等。只输出一句简短结论，需要时加一行 [ACTION:xxx]。
 
-根据用户意图在回复中加对应标签（单独一行）。标签触发后，系统会用「当前摄像头已识别的文字」执行，并把结果显示在对话框里；你只需输出结论+标签，不要自己翻译/写读音/写例句：
-- 朗读/读一下/读出来/读一下视频 → [ACTION:read]（朗读当前识别文字）
-- 翻译 → [ACTION:translate]（系统将当前识别文字翻译后显示在对话框）
-- 读音/拼音/怎么读 → [ACTION:pronounce]（系统给出读音后显示在对话框）
-- 例句/举例 → [ACTION:examples]（系统给出例句后显示在对话框）
+根据用户意图在回复中加对应标签（单独一行）。标签触发后由系统执行并显示结果；你只输出一句结论+标签，不要自己写翻译/读音/例句正文：
+- 朗读/读一下/读出来/读一下视频 → [ACTION:read]（朗读当前画面文字）
+- 翻译（当前画面）→ [ACTION:translate]（系统翻译当前画面文字并显示）
+- 翻译之前的/上一句/刚才的/刚才那句 → [ACTION:translate_previous]（系统翻译对话里上一次朗读的【内容】并显示）
+- 读音/拼音/怎么读 → [ACTION:pronounce]
+- 例句/举例 → [ACTION:examples]
 - 把识别到的文字发到对话/发到这里 → [ACTION:send_ocr_result]
 其他（打招呼、问功能）只回复一句，不加 ACTION。
 
 若你习惯先推理再结论：请务必在最后单独一行输出结论和 [ACTION:xxx]，例如最后一行：好的，正在朗读。\n[ACTION:read]
 （界面只会展示最后这句短结论，前面的推理不会显示。）
 
-示例：用户说「翻译」→ 你只回复：好的，正在翻译。\n[ACTION:translate]"""
+示例：用户说「翻译」→ 你只回复：好的，正在翻译。\n[ACTION:translate]。用户说「翻译之前的句子」→ 你只回复：好的，正在翻译上一句。\n[ACTION:translate_previous]"""
 
 # 对话框内展示给用户的功能说明（无对话时显示）
 DIALOG_FEATURE_PROMPT = """【可用功能】摄像头会实时识别画面中的文字，您可以说或输入：
 
-· 读一下 / 读出来 / 读一下视频 —— 朗读摄像头窗口上当前识别并显示的那段文字
-· 翻译 —— 把当前文字翻译成目标语言
+· 读一下 / 读出来 / 读一下视频 —— 朗读当前识别文字，对话中会显示【内容】和「播放」按钮
+· 翻译 —— 把当前画面文字翻译；「翻译之前的句子」—— 翻译对话里上一次朗读的【内容】
 · 读音 / 拼音 / 怎么读 —— 显示当前文字的读音或音标
 · 例句 —— 给出当前词句的例句
 · 把识别到的文字发到这里 / 发到对话框 —— 将当前识别结果显示在对话中
@@ -146,7 +156,7 @@ DIALOG_FEATURE_PROMPT = """【可用功能】摄像头会实时识别画面中�
 
 # 视觉 LLM：用本地/云端视觉模型从截图提取文字，与 OCR 交叉验证
 ENABLE_VISION_LLM = False   # 需视觉模型（如 gpt-4o / Qwen-VL / LLaVA），LM Studio 需加载视觉模型
-VISION_LLM_MODEL = ""      # 空则用 LLM_MODEL（当前 qwen3-VL-8b-thinking 支持识图）
+VISION_LLM_MODEL = ""      # 空则用 LLM_MODEL（qwen3-vl-8b 支持识图）
 VISION_LLM_TIMEOUT_SEC = 20
 VISION_LLM_MAX_TOKENS = 500
 VISION_LLM_MAX_LONG_EDGE = 1024   # 图长边上限，超则缩放以省显存/流量
@@ -183,6 +193,8 @@ TTS_VOICE_EN = "en-US-JennyNeural"
 TTS_VOICE_FR = "fr-FR-DeniseNeural"
 # 无法检测或非英法时使用的默认语言（用于选发音人）
 TTS_DEFAULT_LANG = "en"
+# 强制朗读语言：设为 "fr" 或 "en" 时不再自动检测，直接用法语/英语读（OCR 无重音时用法语可设 TTS_FORCE_LANG = "fr"）
+TTS_FORCE_LANG = ""
 TTS_RATE = "+0%"   # 语速，如 "+5%" 略快、"-10%" 略慢
 # 纠错结果稳定后再朗读：最近 N 次中至少 K 次相同/相似才触发朗读
 TTS_DEBOUNCE_HISTORY_LEN = 3
